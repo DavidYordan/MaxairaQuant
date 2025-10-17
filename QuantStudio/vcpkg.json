@@ -1,0 +1,18 @@
+{
+  "name": "quantstudio",
+  "version-string": "0.2.0",
+  "description": "High-performance quant terminal skeleton",
+  "dependencies": [
+    "spdlog",
+    "fmt",
+    "nlohmann-json",
+    "yaml-cpp",
+    "boost-asio",
+    "boost-beast",
+    "boost-system",
+    "openssl",
+    { "name": "imgui", "default-features": false, "features": ["win32-binding", "dx11-binding", "docking-experimental"] },
+    "implot"
+  ],
+  "builtin-baseline": "0e39c10736341cc8135b560438229bbda3d3219a"
+}

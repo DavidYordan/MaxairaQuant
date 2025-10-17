@@ -1,0 +1,88 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: maxaira-data-collector
+  profiles:
+    active: dev
+
+# 核心业务配置 - 仅保留关键业务参数
+app:
+  # 数据源配置 - 核心业务参数
+  binance:
+    data-download-base-url: https://data.binance.vision
+    spot-ws-url: wss://stream.binance.com:9443/ws/
+    um-ws-url: wss://fstream.binance.com/ws/
+    cm-ws-url: wss://dstream.binance.com/ws/
+    spot-rest-url: https://data-api.binance.vision/api/v3/klines
+    um-rest-url: https://fapi.binance.com/fapi/v1/klines
+    cm-rest-url: https://dapi.binance.com/dapi/v1/klines
+    api-max-limit: 1000
+    requests-per-second: 15
+  # 数据库配置 - 核心连接参数
+  clickhouse:
+    host: localhost
+    port: 8123
+    database: binance
+    username: default
+    password: 
+  # 数据库初始化配置 - 主流币种列表
+  database:
+    backfill-start-date: 2020-01-01
+    main-stream-symbols:
+      - BTCUSDT
+      - ETHUSDT
+    market-types:
+      - SPOT
+      - UM
+      - CM
+  # 数据缓冲配置 - 关键性能参数
+  data-buffer:
+    buffer-size: 1000
+    flush-interval-seconds: 15
+    batch-size: 2000
+    batch-timeout-ms: 5000
+    ring-buffer-size: 8192
+    wait-strategy: YIELDING
+  # WebSocket配置 - 连接参数
+  websocket:
+    max-reconnect-attempts: 10
+    reconnect-delay: 1000
+    heartbeat-timeout: 60000
+  # 监控配置 - 运维参数
+  monitoring:
+    metrics-enabled: true
+    detailed-logging: false
+    performance-log-interval-seconds: 300
+    health-check-interval-seconds: 30
+
+# 日志配置
+logging:
+  level:
+    com.maxaira: INFO
+    root: WARN
+    com.clickhouse: ERROR
+    org.springframework.web: WARN
+    com.lmax.disruptor: WARN
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+
+# Spring Boot Actuator配置
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,info
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: when-authorized
+    metrics:
+      access: UNRESTRICTED
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99

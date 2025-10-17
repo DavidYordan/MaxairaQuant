@@ -1,0 +1,36 @@
+app:
+  environment: dev
+
+  clickhouse:
+    host: "localhost"
+    port: 8123
+    database: "maxaira"
+    username: "default"
+    password: ""
+    timeout_ms: 10000
+    async_insert: true
+
+  binance:
+    spot:
+      ws_url: "wss://stream.binance.com:9443/ws/"
+      rest_url: "https://data-api.binance.vision/api/v3/klines"
+    um:
+      ws_url: "wss://fstream.binance.com/ws/"
+      rest_url: "https://fapi.binance.com/fapi/v1/klines"
+    cm:
+      ws_url: "wss://dstream.binance.com/ws/"
+      rest_url: "https://dapi.binance.com/dapi/v1/klines"
+
+  buffer:
+    batch_size: 1000
+    flush_interval_ms: 2000
+
+  websocket:
+    reconnect:
+      initial_backoff_ms: 500
+      max_backoff_ms: 10000
+
+  backfill:
+    concurrency_windows: 4
+    window_minutes: 60
+    start_date: "2020-01-01"
