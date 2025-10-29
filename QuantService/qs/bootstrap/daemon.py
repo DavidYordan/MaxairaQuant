@@ -1,16 +1,16 @@
 import asyncio
 from pathlib import Path
 from loguru import logger
-from qs.config.loader import load_config
-from qs.db.client import get_client
-from qs.db.schema import ensure_base_tables
-from qs.db.queries import get_enabled_pairs
-from qs.services.backfill.manager import BackfillManager
-from qs.scheduler.gap_heal import GapHealScheduler
-from qs.services.ws.supervisor import WebSocketSupervisor
-from qs.services.ws.client_server import ClientServer
-from qs.services.indicator.offline import IndicatorOfflineService
-from qs.services.indicator.online import IndicatorOnlineService
+from ..config.loader import load_config
+from ..db.client import get_client
+from ..db.schema import ensure_base_tables
+from ..db.queries import get_enabled_pairs
+from ..services.backfill.manager import BackfillManager
+from ..scheduler.gap_heal import GapHealScheduler
+from ..services.ws.supervisor import WebSocketSupervisor
+from ..services.ws.client_server import ClientServer
+from ..services.indicator.offline import IndicatorOfflineService
+from ..services.indicator.online import IndicatorOnlineService
 
 async def run_daemon(cfg_path: Path | str = None):
     # 1) 配置与DB
