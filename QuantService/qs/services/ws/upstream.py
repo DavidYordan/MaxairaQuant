@@ -5,9 +5,9 @@ import time
 from decimal import Decimal
 import websockets
 from loguru import logger
-from buffer.buffer import DataBuffer
-from gateways.binance_ws import build_subscription_url
-from common.types import Kline
+from ...buffer.buffer import DataBuffer
+from ...gateways.binance_ws import build_subscription_url
+from ...common.types import Kline
 
 class UpstreamStream:
     def __init__(self, base_ws_url: str, symbol: str, period: str, buffer: DataBuffer, heartbeat_timeout_ms: int, initial_backoff_ms: int, max_backoff_ms: int):

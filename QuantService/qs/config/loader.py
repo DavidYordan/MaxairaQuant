@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 import yaml
-from schema import AppConfig
+from .schema import AppConfig
 
 
 def load_config(path: str | Path) -> AppConfig:

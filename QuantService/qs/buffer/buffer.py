@@ -1,8 +1,8 @@
 from __future__ import annotations
 import asyncio
 from typing import List, Optional
-from common.types import Kline
-from db.queries import insert_klines
+from ..common.types import Kline
+from ..db.queries import insert_klines
 
 
 class DataBuffer:

@@ -7,8 +7,8 @@ from typing import Optional, Dict, Any, List, Tuple
 import websockets
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from loguru import logger
-from db.schema import kline_table_name
-from db.client import Client
+from ...db.schema import kline_table_name
+from ...db.client import Client
 
 class QueryLimiter:
     def __init__(self, qps: int):

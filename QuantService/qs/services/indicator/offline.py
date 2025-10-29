@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import List, Tuple
 from clickhouse_connect.driver.client import Client
-from db.schema import kline_table_name
+from ...db.schema import kline_table_name
 
 class IndicatorOfflineService:
     def __init__(self, client: Client):

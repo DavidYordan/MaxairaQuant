@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import List, Tuple
 from clickhouse_connect.driver.client import Client
-from common.types import Kline
+from ..common.types import Kline
 
 
 def get_enabled_pairs(client: Client) -> List[Tuple[str, str]]:

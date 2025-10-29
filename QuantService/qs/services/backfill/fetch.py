@@ -2,9 +2,9 @@ from __future__ import annotations
 from typing import Optional, List, Tuple
 from decimal import Decimal
 import httpx
-from common.types import MarketType, Kline
-from config.schema import AppConfig
-from gateways.binance_rest import rest_url, build_params
+from ...common.types import MarketType, Kline
+from ...config.schema import AppConfig
+from ...gateways.binance_rest import rest_url, build_params
 
 async def fetch_klines(
     cfg: AppConfig,

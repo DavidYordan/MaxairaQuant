@@ -3,12 +3,12 @@ import asyncio
 import time
 from typing import Dict, List, Tuple
 from loguru import logger
-from config.schema import AppConfig
-from db.schema import kline_table_name, ensure_kline_table
-from db.queries import get_enabled_pairs, find_gaps_windowed_sql
-from services.backfill.manager import BackfillManager
-from gateways.binance_rest import step_ms
-from common.types import MarketType
+from ..config.schema import AppConfig
+from ..db.schema import kline_table_name, ensure_kline_table
+from ..db.queries import get_enabled_pairs, find_gaps_windowed_sql
+from ..services.backfill.manager import BackfillManager
+from ..gateways.binance_rest import step_ms
+from ..common.types import MarketType
 
 class GapHealScheduler:
     def __init__(self, cfg: AppConfig, ch_client, backfill: BackfillManager):

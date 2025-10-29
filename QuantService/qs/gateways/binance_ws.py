@@ -1,6 +1,6 @@
 from __future__ import annotations
-from common.types import MarketType
-from config.schema import AppConfig
+from ..common.types import MarketType
+from ..config.schema import AppConfig
 
 def ws_base_url(cfg: AppConfig, market: MarketType) -> str:
     if market == MarketType.spot:

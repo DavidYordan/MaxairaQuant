@@ -2,9 +2,9 @@ from __future__ import annotations
 import asyncio
 from typing import List, Tuple, Dict
 from clickhouse_connect.driver.client import Client
-from db.schema import kline_table_name
-from db.queries import get_max_open_time
-from gateways.binance_rest import step_ms
+from ...db.schema import kline_table_name
+from ...db.queries import get_max_open_time
+from ...gateways.binance_rest import step_ms
 
 class IndicatorOnlineService:
     def __init__(self, client: Client, poll_interval_ms: int = 2000):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Optional, Dict
-from common.types import MarketType
-from config.schema import AppConfig
+from ..common.types import MarketType
+from ..config.schema import AppConfig
 
 def rest_url(cfg: AppConfig, market: MarketType) -> str:
     if market == MarketType.spot:

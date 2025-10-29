@@ -1,7 +1,7 @@
 from __future__ import annotations
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
-from config.schema import ClickHouseConfig
+from ..config.schema import ClickHouseConfig
 
 
 def get_client(cfg: ClickHouseConfig) -> Client:

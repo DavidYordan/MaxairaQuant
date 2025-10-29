@@ -2,15 +2,15 @@ from __future__ import annotations
 import asyncio
 from typing import List, Optional, Tuple, Dict
 from loguru import logger
-from buffer.buffer import DataBuffer
-from common.types import MarketType
-from config.schema import AppConfig
-from gateways.binance_rest import step_ms
-from services.backfill.rate_limiter import ApiRateLimiter
-from services.backfill.fetch import fetch_klines
-from services.proxy.registry import get_enabled_proxy_url
-from db.schema import ensure_kline_table, kline_table_name
-from monitoring.metrics import Metrics
+from ...buffer.buffer import DataBuffer
+from ...common.types import MarketType
+from ...config.schema import AppConfig
+from ...gateways.binance_rest import step_ms
+from ...services.backfill.rate_limiter import ApiRateLimiter
+from ...services.backfill.fetch import fetch_klines
+from ...services.proxy.registry import get_enabled_proxy_url
+from ...db.schema import ensure_kline_table, kline_table_name
+from ...monitoring.metrics import Metrics
 
 class BackfillManager:
     def __init__(self, cfg: AppConfig, ch_client):
