@@ -87,10 +87,9 @@ def find_gaps_windowed_sql(
     gaps: List[Tuple[int, int]] = []
     for row in rs.result_rows:
         ot = int(row[0])
-        prev = row[1]
-        if prev is None:
+        prev = int(row[1] or 0)
+        if prev < min_ot:
             continue
-        prev = int(prev)
         if ot - prev > step_ms:
             gaps.append((prev + step_ms, ot - step_ms))
 
