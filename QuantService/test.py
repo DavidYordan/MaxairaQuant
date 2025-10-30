@@ -13,14 +13,6 @@ PARAMS = {
     "limit": 10,
 }
 
-# async def main():
-#     async with httpx.AsyncClient(proxies=PROXY, timeout=10) as client:
-#         try:
-#             resp = await client.get(URL, params=PARAMS)
-#             print(f"状态码: {resp.status_code}")
-#             print("响应内容:")
-#         except Exception as e:
-#             print("请求出错:", e)
 async def main():
     transport = httpx.AsyncHTTPTransport(proxy=PROXY)
     async with httpx.AsyncClient(transport=transport, timeout=10) as client:
