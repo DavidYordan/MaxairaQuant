@@ -23,12 +23,6 @@ def get_client(cfg: ClickHouseConfig) -> Client:
         password=cfg.password,
         database=cfg.database,
         send_receive_timeout=30,
-        # 高性能连接池配置 - 硬编码优化参数
-        pool_mgr=True,
-        pool_size=16,           # 适中的连接池大小
-        max_pool_size=32,       # 最大32个连接
-        pool_reset=False,       # 避免频繁重置
-        # HTTP连接优化
         compress=True,          # 启用压缩
         query_limit=0,          # 无查询限制
     )
