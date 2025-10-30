@@ -57,18 +57,27 @@ async def get_clients(
     创建三个 ClickHouse 客户端：read / write / backfill，对应不同并发池。
     """
     try:
-        # 先确保数据库存在（default 库上做）
-        bootstrap = clickhouse_connect.get_client(
-            host=cfg.host,
-            port=cfg.port,
-            username=cfg.username,
-            password=cfg.password,
-            database="default",
-            send_receive_timeout=30,
-            connect_timeout=10,
-        )
-        bootstrap.command(f"CREATE DATABASE IF NOT EXISTS {cfg.database}")
-        bootstrap.close()
+        # 步骤1：使用异步方式、临时客户端来确保数据库存在
+        # 这避免了在 async 函数中使用同步 IO，并隔离了引导操作
+        bootstrap_client_raw = None
+        try:
+            bootstrap_client_raw = await clickhouse_connect.get_async_client(
+                host=cfg.host,
+                port=cfg.port,
+                username=cfg.username,
+                password=cfg.password,
+                database="default",
+                connect_timeout=10,
+                send_receive_timeout=30
+            )
+            await bootstrap_client_raw.command(f"CREATE DATABASE IF NOT EXISTS {cfg.database}")
+            logger.info(f"✅ 数据库 '{cfg.database}' 已确认存在")
+        finally:
+            if bootstrap_client_raw:
+                await bootstrap_client_raw.close()
+        
+        # 稍微延迟，给予数据库准备时间，避免后续连接立即失败
+        await asyncio.sleep(0.1)
 
         def make_sync():
             return clickhouse_connect.get_client(

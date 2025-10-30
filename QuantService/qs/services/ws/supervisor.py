@@ -4,7 +4,6 @@ from loguru import logger
 from ...config.schema import AppConfig
 from ...db.schema import kline_table_name
 from ...db.client import AsyncClickHouseClient
-from ...buffer.buffer import DataBuffer
 from ...gateways.binance_ws import ws_base_url
 from ...common.types import MarketType
 from .upstream import UpstreamStream
@@ -17,7 +16,6 @@ class WebSocketSupervisor:
         self.read_client = ch_read_client
         self.write_client = ch_write_client
         self.streams: Dict[str, UpstreamStream] = {}
-        self.buffers: Dict[str, DataBuffer] = {}
         self.status: Dict[str, str] = {}
         self.event_bus = event_bus
 
@@ -28,28 +26,16 @@ class WebSocketSupervisor:
         m = MarketType(market)
         base = ws_base_url(self.cfg, m)
         table = kline_table_name(symbol, market, period)
-        buf = self.buffers.get(key)
-        if not buf:
-            # 创建缓冲区，使用优化的默认参数
-            buf = DataBuffer(
-                client=self.write_client, 
-                table_name=table, 
-                batch_size=2000,           # 优化的批次大小
-                flush_interval_ms=1500,    # 1.5秒刷新间隔
-                event_bus=self.event_bus,
-                writer_workers=4,          # 4个写入工作器
-                max_queue_size=20000       # 2万条队列大小
-            )
-            self.buffers[key] = buf
-            await buf.start()
         stream = UpstreamStream(
             base_ws_url=base,
             symbol=symbol,
             period=period,
-            buffer=buf,
-            heartbeat_timeout_ms=60000,    # 60秒心跳超时
-            initial_backoff_ms=500,        # 500ms初始退避
-            max_backoff_ms=10000,          # 10秒最大退避
+            write_client=self.write_client,      # 传入 write_client
+            table_name=table,                    # 传入 table_name
+            event_bus=self.event_bus,            # 传入 event_bus
+            heartbeat_timeout_ms=60000,
+            initial_backoff_ms=500,
+            max_backoff_ms=10000,
         )
         self.streams[key] = stream
         await stream.start()
@@ -62,9 +48,6 @@ class WebSocketSupervisor:
         if stream:
             await stream.stop()
             self.status[key] = "stopped"
-        buf = self.buffers.pop(key, None)
-        if buf:
-            await buf.stop()
         logger.info("WS 流已停止：{}", key)
 
     async def start_enabled_streams(self):
