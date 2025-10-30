@@ -22,7 +22,7 @@ PARAMS = {
 #         except Exception as e:
 #             print("请求出错:", e)
 async def main():
-    transport = httpx.AsyncHTTPTransport(proxies=PROXY)
+    transport = httpx.AsyncHTTPTransport(proxy=PROXY)
     async with httpx.AsyncClient(transport=transport, timeout=10) as client:
         try:
             resp = await client.get(URL, params=PARAMS)
