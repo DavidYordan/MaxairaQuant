@@ -1,28 +1,33 @@
 from __future__ import annotations
 import asyncio
+from loguru import logger
 from typing import List, Tuple
-from clickhouse_connect.driver.client import Client
+from .client import AsyncClickHouseClient
 from ..common.types import Kline
 
 
-async def get_enabled_pairs(client: Client) -> List[Tuple[str, str]]:
-    rs = await asyncio.to_thread(
-        client.query,
+async def get_enabled_pairs(client: AsyncClickHouseClient) -> List[Tuple[str, str]]:
+    """获取启用的交易对"""
+    rs = await client.query(
         "SELECT symbol, market_type FROM trading_pair_config WHERE enabled = 1 ORDER BY symbol, market_type"
     )
-    return [(row[0], row[1]) for row in rs.result_rows]
+    return [(str(row[0]), str(row[1])) for row in rs.result_rows]
 
 
-async def get_max_open_time(client: Client, table_name: str) -> int:
-    rs = await asyncio.to_thread(client.query, f"SELECT max(open_time) FROM {table_name}")
+async def get_max_open_time(client: AsyncClickHouseClient, table_name: str) -> int:
+    """获取表中最大的开盘时间"""
+    rs = await client.query(f"SELECT max(open_time) FROM {table_name}")
     val = rs.first_row[0]
     return int(val or 0)
 
 
-async def insert_klines(client: Client, table_name: str, klines: List[Kline]) -> None:
+async def insert_klines(client: AsyncClickHouseClient, table_name: str, klines: List[Kline]) -> None:
+    """批量插入K线数据"""
     if not klines:
         return
-    rows = [
+        
+    # 预处理数据以提高性能
+    data = [
         [
             k.open_time_ms,
             k.close_time_ms,
@@ -32,84 +37,88 @@ async def insert_klines(client: Client, table_name: str, klines: List[Kline]) ->
             str(k.close),
             str(k.volume),
             str(k.quote_volume),
-            int(k.count),
+            k.count,
             str(k.taker_buy_base_volume),
             str(k.taker_buy_quote_volume),
         ]
         for k in klines
     ]
-    await asyncio.to_thread(
-        client.insert,
-        table_name,
-        rows,
-        column_names=[
-            "open_time",
-            "close_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "quote_volume",
-            "count",
-            "taker_buy_base_volume",
-            "taker_buy_quote_volume",
-        ],
-    )
+    
+    column_names = [
+        "open_time", "close_time", "open", "high", "low", "close",
+        "volume", "quote_volume", "count", "taker_buy_base_volume", "taker_buy_quote_volume"
+    ]
+    
+    await client.insert(table_name, data, column_names=column_names)
 
 
-def find_gaps_windowed_sql(
-    client: Client,
+async def find_gaps_windowed_sql(
+    client: AsyncClickHouseClient,
     table_name: str,
     window_start_ms: int,
     window_end_ms: int,
     step_ms: int,
 ) -> List[Tuple[int, int]]:
-    # 统计、边界
-    agg = client.query(
-        f"SELECT count() AS c, min(open_time) AS min_ot, max(open_time) AS max_ot FROM {table_name} WHERE open_time >= {window_start_ms} AND open_time <= {window_end_ms}"
-    ).first_row
-    count = int(agg[0] or 0)
-    if count == 0:
-        return [(window_start_ms, window_end_ms)]
-    min_ot = int(agg[1])
-    max_ot = int(agg[2])
+    """使用窗口化SQL查找数据缺口"""
+    try:
+        # 统计、边界 - 使用单个查询获取所有统计信息
+        agg = await client.query(
+            f"""SELECT 
+                count() AS c, 
+                min(open_time) AS min_ot, 
+                max(open_time) AS max_ot 
+            FROM {table_name} 
+            WHERE open_time >= {window_start_ms} AND open_time <= {window_end_ms}"""
+        )
+        
+        count = int(agg.first_row[0] or 0)
+        if count == 0:
+            return [(window_start_ms, window_end_ms)]
+            
+        min_ot = int(agg.first_row[1])
+        max_ot = int(agg.first_row[2])
 
-    # 中间缺口（lag）
-    rs = client.query(
-        f"""
-        SELECT
-          open_time,
-          lag(open_time, 1) OVER (ORDER BY open_time) AS prev_ot
-        FROM {table_name}
-        WHERE open_time >= {window_start_ms} AND open_time <= {window_end_ms}
-        ORDER BY open_time
-        """
-    )
+        # 中间缺口（lag）- 优化查询性能
+        rs = await client.query(
+            f"""
+            SELECT
+              open_time,
+              lag(open_time, 1) OVER (ORDER BY open_time) AS prev_ot
+            FROM {table_name}
+            WHERE open_time >= {window_start_ms} AND open_time <= {window_end_ms}
+            ORDER BY open_time
+            """
+        )
 
-    gaps: List[Tuple[int, int]] = []
-    for row in rs.result_rows:
-        ot = int(row[0])
-        prev = int(row[1] or 0)
-        if prev < min_ot:
-            continue
-        if ot - prev > step_ms:
-            gaps.append((prev + step_ms, ot - step_ms))
+        gaps: List[Tuple[int, int]] = []
+        
+        # 处理中间缺口
+        for row in rs.result_rows:
+            ot = int(row[0])
+            prev = int(row[1] or 0)
+            if prev < min_ot:
+                continue
+            if ot - prev > step_ms:
+                gaps.append((prev + step_ms, ot - step_ms))
 
-    # 头缺口
-    if min_ot > window_start_ms:
-        gaps.append((window_start_ms, min_ot - step_ms))
+        # 头缺口
+        if min_ot > window_start_ms:
+            gaps.append((window_start_ms, min_ot - step_ms))
 
-    # 尾缺口
-    last_expected = max_ot + step_ms
-    if last_expected <= window_end_ms:
-        gaps.append((last_expected, window_end_ms))
+        # 尾缺口
+        last_expected = max_ot + step_ms
+        if last_expected <= window_end_ms:
+            gaps.append((last_expected, window_end_ms))
 
-    gaps.sort(key=lambda g: g[0])
-    return gaps
+        gaps.sort(key=lambda g: g[0])
+        return gaps
+        
+    except Exception as e:
+        logger.error(f"查找缺口失败 {table_name}: {e}")
+        raise
 
-def insert_indicator_ma_incremental(
-    client: Client,
+async def insert_indicator_ma_incremental(
+    client: AsyncClickHouseClient,
     source_table: str,
     symbol: str,
     market: str,
@@ -117,7 +126,7 @@ def insert_indicator_ma_incremental(
     start_ms: int,
     end_ms: int,
 ) -> None:
-    client.query(
+    await client.query(
         f"""
         INSERT INTO indicator_ma (symbol, market, period, open_time, ma20, ma50)
         SELECT
@@ -139,11 +148,23 @@ def insert_indicator_ma_incremental(
         },
     )
 
-def get_latest_enabled_proxy(client: Client) -> Tuple[str, int, str | None, str | None] | None:
-    rs = client.query(
-        "SELECT host, port, username, password FROM proxy_config WHERE enabled = 1 ORDER BY updated_at DESC LIMIT 1"
-    )
-    if not rs.result_rows:
+async def get_latest_enabled_proxy(client: AsyncClickHouseClient) -> Tuple[str, int, str | None, str | None] | None:
+    """获取最新启用的代理配置"""
+    try:
+        rs = await client.query(
+            """SELECT host, port, username, password 
+            FROM proxy_config 
+            WHERE enabled = 1 
+            ORDER BY updated_at DESC 
+            LIMIT 1"""
+        )
+        
+        if not rs.result_rows:
+            return None
+            
+        host, port, username, password = rs.result_rows[0]
+        return str(host), int(port), (username or None), (password or None)
+        
+    except Exception as e:
+        logger.error(f"获取代理配置失败: {e}")
         return None
-    host, port, username, password = rs.result_rows[0]
-    return str(host), int(port), (username or None), (password or None)

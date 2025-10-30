@@ -209,7 +209,7 @@ class UpstreamStream:
 #### ClientServer - 客户端WS服务器
 ```python
 class ClientServer:
-    def __init__(self, ch_client: Client, host: str = "0.0.0.0", port: int = 8765, 
+    def __init__(self, ch_client: AsyncClickHouseClient, host: str = "0.0.0.0", port: int = 8765, 
                  qps: int = 20, hot_hours: int = 6, cache_ttl_s: float = 5.0):
 ```
 
@@ -243,7 +243,7 @@ class GapHealScheduler:
 #### IndicatorOnlineService - 在线指标计算
 ```python
 class IndicatorOnlineService:
-    def __init__(self, client: Client):
+    def __init__(self, client: AsyncClickHouseClient):
         self.client = client
         self._tasks: List[asyncio.Task] = []
 ```
@@ -265,7 +265,7 @@ class IndicatorOnlineService:
 #### BacktestEngine - 策略回测引擎
 ```python
 class BacktestEngine:
-    def __init__(self, client: Client):
+    def __init__(self, client: AsyncClickHouseClient):
         self.client = client
 
     async def run(self, job_id: str, strategy: Strategy, symbol: str, market: str, 
@@ -300,7 +300,7 @@ class TradingService:
 
 #### ProxyRegistry - 代理注册器
 ```python
-def get_enabled_proxy_url(client: Client) -> Optional[str]:
+def get_enabled_proxy_url(client: AsyncClickHouseClient) -> Optional[str]:
     rec = get_latest_enabled_proxy(client)
     if rec is None:
         return None

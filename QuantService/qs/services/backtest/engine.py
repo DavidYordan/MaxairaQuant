@@ -3,8 +3,8 @@ import asyncio
 import json
 from dataclasses import dataclass
 from typing import Dict, Any, List
-from clickhouse_connect.driver.client import Client
-from db.schema import kline_table_name
+from ...db.client import AsyncClickHouseClient
+from ...db.schema import kline_table_name
 
 @dataclass
 class Bar:
@@ -27,13 +27,12 @@ class Strategy:
         return {"pnl": 0.0, "sharpe": 0.0, "trades": []}
 
 class WindowReader:
-    def __init__(self, client: Client):
+    def __init__(self, client: AsyncClickHouseClient):
         self.client = client
 
     async def read(self, symbol: str, market: str, period: str, start_ms: int, end_ms: int) -> List[Bar]:
         table = kline_table_name(symbol, market, period)
-        rs = await asyncio.to_thread(
-            self.client.query,
+        rs = await self.client.query(
             f"""
             SELECT open_time, toFloat64(open), toFloat64(high), toFloat64(low), toFloat64(close), toFloat64(volume)
             FROM {table}
@@ -44,16 +43,15 @@ class WindowReader:
         return [Bar(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in rs.result_rows]
 
 class BacktestEngine:
-    def __init__(self, client: Client):
+    def __init__(self, client: AsyncClickHouseClient):
         self.client = client
 
     async def run(self, job_id: str, strategy: Strategy, symbol: str, market: str, period: str, start_ms: int, end_ms: int) -> None:
         reader = WindowReader(self.client)
-        bars = reader.read(symbol, market, period, start_ms, end_ms)
+        bars = await reader.read(symbol, market, period, start_ms, end_ms)
         signals = strategy.on_bars(bars)
         metrics = strategy.finalize()
-        await asyncio.to_thread(
-            self.client.query,
+        await self.client.query(
             """
             INSERT INTO backtest_results (job_id, symbol, market, period, params_json, metric_pnl, metric_sharpe, trades_json)
             VALUES (%(job_id)s, %(symbol)s, %(market)s, %(period)s, %(params)s, %(pnl)s, %(sharpe)s, %(trades)s)

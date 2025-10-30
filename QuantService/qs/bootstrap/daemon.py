@@ -16,16 +16,16 @@ async def run_daemon(cfg_path: Path | str = None):
     # 1) 配置与DB
     cfg_path = cfg_path or (Path(__file__).parents[2] / "config" / "app.yaml")
     cfg = load_config(cfg_path)
-    client = get_client(cfg.clickhouse)
-    ensure_base_tables(client)
+    client = await get_client(cfg.clickhouse)  # 改为异步调用
+    await ensure_base_tables(client)
     # 集中初始化：默认交易对与K线表
-    ensure_bootstrap_defaults(client, cfg.binance.assets)
+    await ensure_bootstrap_defaults(client, cfg.binance.assets)
     # 新增：指标与回测表的集中初始化
-    ensure_indicator_tables(client)
-    ensure_backtest_tables(client)
+    await ensure_indicator_tables(client)
+    await ensure_backtest_tables(client)
     # 初始化指标视图（根据启用的交易对与周期创建）
-    pairs = get_enabled_pairs(client)
-    ensure_indicator_views_for_pairs(client, pairs, ["1m", "1h"])
+    pairs = await get_enabled_pairs(client)
+    await ensure_indicator_views_for_pairs(client, pairs, ["1m", "1h"])
 
     # 4) 组装各服务
     event_bus = EventBus()

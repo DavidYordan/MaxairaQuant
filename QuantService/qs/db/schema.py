@@ -1,8 +1,8 @@
 from __future__ import annotations
-from clickhouse_connect.driver.client import Client
+from .client import AsyncClickHouseClient
 
-def ensure_base_tables(client: Client) -> None:
-    client.command(
+async def ensure_base_tables(client: AsyncClickHouseClient) -> None:
+    await client.command(
         """
         CREATE TABLE IF NOT EXISTS trading_pair_config
         (
@@ -16,7 +16,7 @@ def ensure_base_tables(client: Client) -> None:
         ORDER BY (symbol, market_type)
         """
     )
-    client.command(
+    await client.command(
         """
         CREATE TABLE IF NOT EXISTS proxy_config
         (
@@ -32,7 +32,7 @@ def ensure_base_tables(client: Client) -> None:
         ORDER BY (host, port)
         """
     )
-    client.command(
+    await client.command(
         """
         CREATE TABLE IF NOT EXISTS api_keys
         (
@@ -46,14 +46,8 @@ def ensure_base_tables(client: Client) -> None:
         """
     )
 
-def kline_table_name(symbol: str, market_type: str, period: str) -> str:
-    safe_symbol = symbol.lower().replace("-", "_").replace("/", "_")
-    safe_market = market_type.lower()
-    safe_period = period.lower()
-    return f"kline_{safe_symbol}_{safe_market}_{safe_period}"
-
-def ensure_kline_table(client: Client, table_name: str) -> None:
-    client.command(
+async def ensure_kline_table(client: AsyncClickHouseClient, table_name: str) -> None:
+    await client.command(
         f"""
         CREATE TABLE IF NOT EXISTS {table_name}
         (
@@ -75,23 +69,23 @@ def ensure_kline_table(client: Client, table_name: str) -> None:
         """
     )
 
-def ensure_trading_pair_entry(client: Client, symbol: str, market_type: str, enabled: int) -> None:
-    rs = client.query(
+async def ensure_trading_pair_entry(client: AsyncClickHouseClient, symbol: str, market_type: str, enabled: int) -> None:
+    rs = await client.query(
         "SELECT count() FROM trading_pair_config WHERE symbol = %(s)s AND market_type = %(m)s",
         parameters={"s": symbol, "m": market_type},
     )
     cnt = int(rs.result_rows[0][0]) if rs.result_rows else 0
     if cnt == 0:
-        rs2 = client.query("SELECT coalesce(max(id), 0) FROM trading_pair_config")
+        rs2 = await client.query("SELECT coalesce(max(id), 0) FROM trading_pair_config")
         max_id = int(rs2.result_rows[0][0]) if rs2.result_rows else 0
         new_id = max_id + 1
-        client.insert(
+        await client.insert(
             "trading_pair_config",
             [[new_id, symbol, market_type, int(enabled)]],
             column_names=["id", "symbol", "market_type", "enabled"],
         )
 
-def ensure_bootstrap_defaults(client: Client, assets: list[str]) -> None:
+async def ensure_bootstrap_defaults(client: AsyncClickHouseClient, assets: list[str]) -> None:
     markets = ["spot", "um", "cm"]
     periods = ["1m", "1h"]
     for asset in assets:
@@ -100,13 +94,13 @@ def ensure_bootstrap_defaults(client: Client, assets: list[str]) -> None:
         for m in markets:
             for p in periods:
                 tbl = kline_table_name(symbol, m, p)
-                ensure_kline_table(client, tbl)
+                await ensure_kline_table(client, tbl)
             # 仅 ETHUSDT@um 默认启用，其它默认禁用
             default_enabled = 1 if (symbol == "ETHUSDT" and m == "um") else 0
-            ensure_trading_pair_entry(client, symbol, m, default_enabled)
+            await ensure_trading_pair_entry(client, symbol, m, default_enabled)
 
-def ensure_indicator_tables(client: Client) -> None:
-    client.command(
+async def ensure_indicator_tables(client: AsyncClickHouseClient) -> None:
+    await client.command(
         """
         CREATE TABLE IF NOT EXISTS indicator_ma
         (
@@ -122,13 +116,10 @@ def ensure_indicator_tables(client: Client) -> None:
         """
     )
 
-def indicator_view_name(symbol: str, market: str, period: str) -> str:
-    return f"mv_indicator_ma_{symbol.lower()}_{market.lower()}_{period.lower()}"
-
-def ensure_indicator_view_for_table(client: Client, symbol: str, market: str, period: str) -> None:
+async def ensure_indicator_view_for_table(client: AsyncClickHouseClient, symbol: str, market: str, period: str) -> None:
     table = kline_table_name(symbol, market, period)
     view_name = indicator_view_name(symbol, market, period)
-    client.command(
+    await client.command(
         f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {view_name}
         TO indicator_ma AS
@@ -143,13 +134,13 @@ def ensure_indicator_view_for_table(client: Client, symbol: str, market: str, pe
         """
     )
 
-def ensure_indicator_views_for_pairs(client: Client, pairs: list[tuple[str, str]], periods: list[str]) -> None:
+async def ensure_indicator_views_for_pairs(client: AsyncClickHouseClient, pairs: list[tuple[str, str]], periods: list[str]) -> None:
     for symbol, market in pairs:
         for period in periods:
-            ensure_indicator_view_for_table(client, symbol, market, period)
-
-def ensure_backtest_tables(client: Client) -> None:
-    client.command(
+            await ensure_indicator_view_for_table(client, symbol, market, period)
+            
+async def ensure_backtest_tables(client: AsyncClickHouseClient) -> None:
+    await client.command(
         """
         CREATE TABLE IF NOT EXISTS backtest_results
         (
@@ -167,3 +158,12 @@ def ensure_backtest_tables(client: Client) -> None:
         ORDER BY (job_id, symbol, market, period)
         """
     )
+
+def kline_table_name(symbol: str, market_type: str, period: str) -> str:
+    safe_symbol = symbol.lower().replace("-", "_").replace("/", "_")
+    safe_market = market_type.lower()
+    safe_period = period.lower()
+    return f"kline_{safe_symbol}_{safe_market}_{safe_period}"
+
+def indicator_view_name(symbol: str, market: str, period: str) -> str:
+    return f"mv_indicator_ma_{symbol.lower()}_{market.lower()}_{period.lower()}"

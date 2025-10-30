@@ -3,7 +3,7 @@ from typing import Dict
 from loguru import logger
 from ...config.schema import AppConfig
 from ...db.schema import kline_table_name
-from ...db.client import Client
+from ...db.client import AsyncClickHouseClient
 from ...buffer.buffer import DataBuffer
 from ...gateways.binance_ws import ws_base_url
 from ...common.types import MarketType
@@ -12,7 +12,7 @@ from ...db.queries import get_enabled_pairs
 from .event_bus import EventBus
 
 class WebSocketSupervisor:
-    def __init__(self, cfg: AppConfig, ch_client: Client, event_bus: EventBus | None = None):
+    def __init__(self, cfg: AppConfig, ch_client: AsyncClickHouseClient, event_bus: EventBus | None = None):
         self.cfg = cfg
         self.client = ch_client
         self.streams: Dict[str, UpstreamStream] = {}

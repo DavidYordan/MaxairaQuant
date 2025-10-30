@@ -1,48 +1,106 @@
 from __future__ import annotations
+import asyncio
 import clickhouse_connect
-from clickhouse_connect.driver.client import Client
+from clickhouse_connect.driver.asyncclient import AsyncClient
 from ..config.schema import ClickHouseConfig
+from loguru import logger
 
-def get_client(cfg: ClickHouseConfig) -> Client:
-    # 先确保数据库存在（用 default 连接执行创建）
-    bootstrap = clickhouse_connect.get_client(
-        host=cfg.host,
-        port=cfg.port,
-        username=cfg.username,
-        password=cfg.password,
-        database="default",
-        send_receive_timeout=30,  # 30秒超时
-    )
-    bootstrap.command(f"CREATE DATABASE IF NOT EXISTS {cfg.database}")
-    bootstrap.close()  # 及时关闭临时连接
-    
-    client = clickhouse_connect.get_client(
-        host=cfg.host,
-        port=cfg.port,
-        username=cfg.username,
-        password=cfg.password,
-        database=cfg.database,
-        send_receive_timeout=30,
-        compress=True,          # 启用压缩
-        query_limit=0,          # 无查询限制
-    )
-    
-    # 高性能异步插入配置 - 硬编码优化
-    client.command("SET async_insert = 1")
-    client.command("SET wait_for_async_insert = 1")
-    client.command("SET async_insert_max_data_size = 33554432")      # 32MB
-    client.command("SET async_insert_busy_timeout_ms = 1000")        # 1秒刷新
-    client.command("SET async_insert_stale_timeout_ms = 2000")       # 2秒过期
-    
-    # ClickHouse性能优化设置
-    client.command("SET max_threads = 8")                            # 8线程
-    client.command("SET max_memory_usage = 4294967296")             # 4GB内存
-    client.command("SET max_insert_block_size = 8388608")           # 8MB块
-    client.command("SET min_insert_block_size_rows = 100000")       # 10万行
-    client.command("SET min_insert_block_size_bytes = 67108864")    # 64MB
-    
-    # 网络和IO优化
-    client.command("SET network_compression_method = 'lz4'")         # LZ4压缩
-    client.command("SET max_concurrent_queries_for_user = 16")       # 16并发查询
-        
-    return client
+
+class AsyncClickHouseClient:
+    """
+    官方 AsyncClient 封装版本
+    提供异步 query / command / insert 接口，并保留简单并发控制
+    """
+
+    def __init__(self, async_client: AsyncClient, pool_size: int = 10):
+        self._client = async_client
+        self._semaphore = asyncio.Semaphore(pool_size)
+
+    async def query(self, query: str, parameters=None):
+        """异步查询"""
+        async with self._semaphore:
+            return await self._client.query(query=query, parameters=parameters)
+
+    async def command(self, cmd: str, parameters=None):
+        """异步命令"""
+        async with self._semaphore:
+            return await self._client.command(cmd=cmd, parameters=parameters)
+
+    async def insert(self, table: str, data, column_names=None):
+        """异步插入"""
+        async with self._semaphore:
+            return await self._client.insert(
+                table=table,
+                data=data,
+                column_names=column_names,
+            )
+
+    async def close(self):
+        """关闭连接"""
+        await self._client.close()
+
+
+async def get_client(cfg: ClickHouseConfig) -> AsyncClickHouseClient:
+    """
+    初始化 ClickHouse 异步客户端
+    使用官方 AsyncClient 封装
+    """
+    try:
+        # 步骤1：确保数据库存在（使用 default 数据库临时连接）
+        bootstrap = clickhouse_connect.get_client(
+            host=cfg.host,
+            port=cfg.port,
+            username=cfg.username,
+            password=cfg.password,
+            database="default",
+            send_receive_timeout=30,
+            connect_timeout=10,
+        )
+
+        bootstrap.command(f"CREATE DATABASE IF NOT EXISTS {cfg.database}")
+        bootstrap.close()
+
+        # 步骤2：创建主同步 Client
+        sync_client = clickhouse_connect.get_client(
+            host=cfg.host,
+            port=cfg.port,
+            username=cfg.username,
+            password=cfg.password,
+            database=cfg.database,
+            send_receive_timeout=30,
+            connect_timeout=10,
+            compress=True,
+            query_limit=0,
+        )
+
+        # 步骤3：创建官方 AsyncClient
+        async_client = AsyncClient(client=sync_client)
+
+        # 步骤4：创建封装包装器
+        client = AsyncClickHouseClient(async_client)
+
+        # 步骤5：依次执行配置命令（不可并发，因为底层连接非线程安全）
+        config_commands = [
+            "SET async_insert = 1",
+            "SET wait_for_async_insert = 1",
+            "SET async_insert_max_data_size = 33554432",
+            "SET async_insert_busy_timeout_ms = 1000",
+            "SET async_insert_stale_timeout_ms = 2000",
+            "SET max_threads = 8",
+            "SET max_memory_usage = 4294967296",
+            "SET max_insert_block_size = 8388608",
+            "SET min_insert_block_size_rows = 100000",
+            "SET min_insert_block_size_bytes = 67108864",
+            "SET network_compression_method = 'lz4'",
+            "SET max_concurrent_queries_for_user = 16",
+        ]
+
+        for cmd in config_commands:
+            await client.command(cmd)
+
+        logger.info("✅ ClickHouse 异步客户端初始化完成")
+        return client
+
+    except Exception as e:
+        logger.error(f"❌ ClickHouse 客户端初始化失败: {e}")
+        raise

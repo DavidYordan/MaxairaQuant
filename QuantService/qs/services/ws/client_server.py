@@ -8,7 +8,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from loguru import logger
 from ...db.schema import kline_table_name
-from ...db.client import Client
+from ...db.client import AsyncClickHouseClient
 from ...common.types import Kline
 from .event_bus import EventBus
 
@@ -75,7 +75,7 @@ class HotCache:
         return end_ms >= now_ms - self._window_ms
 
 class ClientServer:
-    def __init__(self, ch_client: Client, host: str = "0.0.0.0", port: int = 8765, qps: int = 20, hot_hours: int = 6, cache_ttl_s: float = 5.0, auth_required: bool = True, default_qps: int = 20, max_page_size: int = 2000, max_subscriptions: int = 2, min_poll_interval_ms: int = 500, event_bus: Optional[EventBus] = None):
+    def __init__(self, ch_client: AsyncClickHouseClient, host: str = "0.0.0.0", port: int = 8765, qps: int = 20, hot_hours: int = 6, cache_ttl_s: float = 5.0, auth_required: bool = True, default_qps: int = 20, max_page_size: int = 2000, max_subscriptions: int = 2, min_poll_interval_ms: int = 500, event_bus: Optional[EventBus] = None):
         self.client = ch_client
         self.host = host
         self.port = port
@@ -262,8 +262,7 @@ class ClientServer:
             self.event_bus.unsubscribe(table, q)
 
     async def _fetch_page(self, table: str, start_ms: int, end_ms: int, limit: int) -> List[Dict[str, Any]]:
-        rs = await asyncio.to_thread(
-            self.client.query,
+        rs = await self.client.query(
             f"""
             SELECT
               open_time, close_time, toString(open), toString(high), toString(low), toString(close),
@@ -294,8 +293,7 @@ class ClientServer:
 
     async def _validate_api_key(self, api_key: str) -> Tuple[bool, int]:
         try:
-            rs = await asyncio.to_thread(
-                self.client.query,
+            rs = await self.client.query(
                 "SELECT enabled, qps_limit FROM api_keys WHERE api_key = %(k)s LIMIT 1",
                 parameters={"k": api_key},
             )
