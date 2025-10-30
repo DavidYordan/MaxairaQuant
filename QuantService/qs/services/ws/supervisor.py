@@ -11,7 +11,7 @@ from ...db.queries import get_enabled_pairs
 from .event_bus import EventBus
 
 class WebSocketSupervisor:
-    def __init__(self, cfg: AppConfig, ch_read_client: AsyncClickHouseClient, ch_write_client: AsyncClickHouseClient, event_bus: EventBus | None = None):
+    def __init__(self, cfg: AppConfig, ch_read_client: AsyncClickHouseClient, ch_write_client: AsyncClickHouseClient, event_bus: EventBus):
         self.cfg = cfg
         self.read_client = ch_read_client
         self.write_client = ch_write_client
@@ -30,12 +30,12 @@ class WebSocketSupervisor:
             base_ws_url=base,
             symbol=symbol,
             period=period,
-            write_client=self.write_client,      # 传入 write_client
-            table_name=table,                    # 传入 table_name
-            event_bus=self.event_bus,            # 传入 event_bus
-            heartbeat_timeout_ms=60000,
-            initial_backoff_ms=500,
-            max_backoff_ms=10000,
+            write_client=self.write_client,
+            table_name=table,
+            event_bus=self.event_bus,
+            heartbeat_timeout_ms=self.cfg.websocket.heartbeat_timeout_ms,
+            initial_backoff_ms=self.cfg.websocket.reconnect.initial_backoff_ms,
+            max_backoff_ms=self.cfg.websocket.reconnect.max_backoff_ms,
         )
         self.streams[key] = stream
         await stream.start()

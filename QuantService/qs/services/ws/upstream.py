@@ -1,8 +1,11 @@
 from __future__ import annotations
+
 import asyncio
 import json
 import time
 from decimal import Decimal
+from typing import Optional, List
+
 import websockets
 from loguru import logger
 
@@ -13,231 +16,268 @@ from ...services.ws.event_bus import EventBus
 
 
 class UpstreamStream:
-    def __init__(self, base_ws_url: str, symbol: str, period: str, 
-                 write_client: AsyncClickHouseClient,
-                 table_name: str,
-                 event_bus: EventBus,
-                 heartbeat_timeout_ms: int, initial_backoff_ms: int, max_backoff_ms: int):
+    def __init__(
+        self,
+        base_ws_url: str,
+        symbol: str,
+        period: str,
+        write_client: AsyncClickHouseClient,
+        table_name: str,
+        event_bus: EventBus,
+        heartbeat_timeout_ms: int = 60000,
+        initial_backoff_ms: int = 500,
+        max_backoff_ms: int = 10000,
+    ) -> None:
         self.base_ws_url = base_ws_url
         self.symbol = symbol
         self.period = period
-        
+
         self.write_client = write_client
         self.table_name = table_name
         self.event_bus = event_bus
-        self._kline_batch: list[Kline] = []
-        self._batch_writer_task: asyncio.Task | None = None
 
         self.heartbeat_timeout_ms = heartbeat_timeout_ms
         self.initial_backoff_ms = initial_backoff_ms
         self.max_backoff_ms = max_backoff_ms
-        self._task: asyncio.Task | None = None
+
+        # ws 主任务
+        self._task: Optional[asyncio.Task] = None
+        # 批量写入任务
+        self._batch_writer_task: Optional[asyncio.Task] = None
+
         self._stop = False
         self._last_msg_ts: float = 0.0
 
-    async def start(self):
-        """启动WebSocket连接"""
+        # 批量缓冲 & 锁
+        self._kline_batch: List[Kline] = []
+        self._batch_lock = asyncio.Lock()
+
+    # -------------------------------------------------------------------------
+    # lifecycle
+    # -------------------------------------------------------------------------
+    async def start(self) -> None:
+        """启动 WebSocket + 写入循环"""
         if self._task is not None:
             logger.warning(f"WS连接已在运行: {self.symbol} {self.period}")
             return
-            
+
         self._stop = False
+
         self._task = asyncio.create_task(
             self._run_with_supervision(),
-            name=f"ws_{self.symbol}_{self.period}"
+            name=f"ws_{self.symbol}_{self.period}",
         )
         self._batch_writer_task = asyncio.create_task(
             self._batch_writer_loop(),
-            name=f"wswriter_{self.symbol}_{self.period}"
+            name=f"wswriter_{self.symbol}_{self.period}",
         )
         logger.info(f"WS连接任务已启动: {self.symbol} {self.period}")
 
-    async def stop(self):
-        """优雅停止WebSocket连接"""
-        if self._task is None:
-            return
-            
+    async def stop(self) -> None:
+        """优雅停止（不管两个任务是不是还在，都要关掉）"""
         logger.info(f"正在停止WS连接: {self.symbol} {self.period}")
         self._stop = True
-        
-        # 取消主任务和写入任务
-        if self._task:
+
+        tasks: List[asyncio.Task] = []
+        if self._task is not None:
             self._task.cancel()
-        if self._batch_writer_task:
+            tasks.append(self._task)
+        if self._batch_writer_task is not None:
             self._batch_writer_task.cancel()
-            
-        tasks_to_wait = [t for t in [self._task, self._batch_writer_task] if t]
-        
-        try:
-            await asyncio.wait_for(asyncio.gather(*tasks_to_wait, return_exceptions=True), timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.warning(f"WS连接停止超时: {self.symbol} {self.period}")
-        
+            tasks.append(self._batch_writer_task)
+
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"WS连接停止超时: {self.symbol} {self.period}")
+
         self._task = None
         self._batch_writer_task = None
         logger.info(f"WS连接已停止: {self.symbol} {self.period}")
 
-    async def _run_with_supervision(self):
-        """带监督的运行逻辑"""
+    # -------------------------------------------------------------------------
+    # supervision
+    # -------------------------------------------------------------------------
+    async def _run_with_supervision(self) -> None:
+        """带监督的运行逻辑：断了就按指数退避重连"""
         consecutive_failures = 0
         max_consecutive_failures = 10
-        
+
         while not self._stop:
             try:
                 await self._run_connection()
-                consecutive_failures = 0  # 重置失败计数
-                
+                # 能正常跑完一次（一般是 ws 自己断了）就重置失败次数
+                consecutive_failures = 0
+
             except asyncio.CancelledError:
                 logger.info(f"WS连接被取消: {self.symbol} {self.period}")
                 break
-                
+
             except Exception as e:
                 consecutive_failures += 1
                 logger.error(
                     f"WS连接异常 {self.symbol} {self.period} "
                     f"(连续第{consecutive_failures}次): {e}"
                 )
-                
+
                 if consecutive_failures >= max_consecutive_failures:
                     logger.error(
                         f"WS连接连续失败过多，停止重连: {self.symbol} {self.period}"
                     )
                     break
-                
-                # 指数退避重连
+
                 backoff_time = min(
                     self.initial_backoff_ms * (2 ** (consecutive_failures - 1)) / 1000.0,
-                    self.max_backoff_ms / 1000.0
+                    self.max_backoff_ms / 1000.0,
                 )
-                
+
                 if not self._stop:
                     logger.info(
                         f"WS将在 {backoff_time:.1f}s 后重连: {self.symbol} {self.period}"
                     )
                     try:
+                        # 3.10 用 wait_for 包一个永不 set 的事件来 sleep
                         await asyncio.wait_for(
-                            asyncio.Event().wait(),  # 永远不会被设置的事件
-                            timeout=backoff_time
+                            asyncio.Event().wait(),
+                            timeout=backoff_time,
                         )
                     except asyncio.TimeoutError:
-                        pass  # 正常超时，继续重连
+                        # 正常超时，继续下一轮
+                        pass
 
-    async def _run_connection(self):
-        """单次连接的运行逻辑"""
+    # -------------------------------------------------------------------------
+    # single connection
+    # -------------------------------------------------------------------------
+    async def _run_connection(self) -> None:
+        """真正的一次连接"""
         url = build_subscription_url(self.base_ws_url, self.symbol, self.period)
         logger.info(f"WS 连接中：{self.symbol} {self.period} -> {url}")
-        
-        # 连接超时控制
+
+        connect_options = {
+            "close_timeout": 10,
+            "max_queue": 1024,
+            "ping_interval": 20,  # 每20秒ping一次
+            "ping_timeout": 10,   # 10秒收不到pong就断
+        }
+
         try:
-            # 依赖 websockets 内置的 ping 机制，不再手动心跳
-            connect_options = {
-                "close_timeout": 10,
-                "max_queue": 1024,
-                "ping_interval": 20,  # 每20秒发送一次ping
-                "ping_timeout": 20,   # 20秒内未收到pong则认为连接断开
-            }
-            async with asyncio.timeout(30.0):  # 30秒连接超时
-                async with websockets.connect(url, **connect_options) as ws:
-                    await self._handle_connection(ws)
-                    
+            ws = await asyncio.wait_for(
+                websockets.connect(url, **connect_options),
+                timeout=30.0,
+            )
         except asyncio.TimeoutError:
             raise Exception("WebSocket连接超时")
 
-    async def _handle_connection(self, ws):
-        """处理WebSocket连接"""
+        # 用 async with 来确保退出时关闭
+        async with ws:
+            await self._handle_connection(ws)
+
+    async def _handle_connection(self, ws) -> None:
+        """收到消息就处理，保活交给 websockets"""
         self._last_msg_ts = time.time()
         logger.info(f"WS连接已建立: {self.symbol} {self.period}")
-        
-        # 移除自定义心跳任务
+
         try:
-            while not self._stop:
-                try:
-                    # 等待消息，超时时间可以设置得更长，因为有ping/pong保活
-                    msg = await asyncio.wait_for(
-                        ws.recv(), 
-                        timeout=self.heartbeat_timeout_ms / 1000.0 + 5 # 比ping interval稍长
-                    )
-                    
-                    self._last_msg_ts = time.time()
-                    await self._handle_message(msg)
-                    
-                except asyncio.TimeoutError:
-                    # 这个超时现在意味着：在指定时间内（例如65s）既没有K线数据，ping/pong也失败了
-                    logger.warning(f"WS 消息接收超时 (或连接丢失)：{self.symbol} {self.period}")
-                    break # 退出并重连
-                    
-                except websockets.exceptions.ConnectionClosed as e:
-                    logger.warning(f"WS 连接关闭：{self.symbol} {self.period} 代码={e.code}")
-                    break
-                    
+            async for msg in ws:
+                self._last_msg_ts = time.time()
+                await self._handle_message(msg)
+
+        except asyncio.CancelledError:
+            logger.info(f"WS 连接被取消：{self.symbol} {self.period}")
+            raise
+
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"WS 连接关闭：{self.symbol} {self.period} 代码={e.code}")
+
         finally:
             logger.debug(f"WS 连接处理器退出: {self.symbol} {self.period}")
 
-    async def _batch_writer_loop(self):
-        """后台任务，批量写入K线并发布事件"""
+    # -------------------------------------------------------------------------
+    # batch writer
+    # -------------------------------------------------------------------------
+    async def _batch_writer_loop(self) -> None:
+        """后台任务：定期把内存里的 K 线批量写入 ClickHouse"""
         while not self._stop:
             try:
-                await asyncio.sleep(1.5)  # 每1.5秒检查一次
-                
-                if not self._kline_batch:
-                    continue
+                await asyncio.sleep(1.5)
 
-                batch_to_write = list(self._kline_batch)
-                self._kline_batch.clear()
+                # 先原子性地“拿走一批”
+                async with self._batch_lock:
+                    if not self._kline_batch:
+                        continue
+                    batch_to_write = self._kline_batch
+                    self._kline_batch = []
 
+                # 写入数据库
                 try:
-                    # 写入数据库
                     await self._insert_klines_direct(batch_to_write)
-                    
-                    # 发布事件 (如果 event_bus 存在)
-                    if self.event_bus:
-                        # 确保发布不会阻塞
-                        asyncio.create_task(
-                            self.event_bus.publish(self.table_name, batch_to_write),
-                            name=f"publish_{self.table_name}"
-                        )
                 except Exception as e:
                     logger.error(f"WS数据直接写入失败: {self.table_name} {e}")
-                    # 失败的数据可以考虑放回队列重试，但暂时只记录日志
-                    
+                    # 写失败就别发事件了
+                    continue
+
             except asyncio.CancelledError:
                 logger.info(f"WS 写入循环被取消: {self.table_name}")
                 break
             except Exception as e:
                 logger.error(f"WS 写入循环异常: {self.table_name} {e}")
-                
-    async def _insert_klines_direct(self, klines: list[Kline]):
-        """直接使用 write_client 插入K线"""
+
+    async def _insert_klines_direct(self, klines: List[Kline]) -> None:
+        """直接写 ClickHouse"""
         if not klines:
             return
-        
+
         data = [
             [
-                k.open_time_ms, k.close_time_ms, str(k.open), str(k.high), str(k.low), str(k.close),
-                str(k.volume), str(k.quote_volume), k.count, str(k.taker_buy_base_volume), str(k.taker_buy_quote_volume)
+                k.open_time_ms,
+                k.close_time_ms,
+                str(k.open),
+                str(k.high),
+                str(k.low),
+                str(k.close),
+                str(k.volume),
+                str(k.quote_volume),
+                k.count,
+                str(k.taker_buy_base_volume),
+                str(k.taker_buy_quote_volume),
             ]
             for k in klines
         ]
-        
+
         column_names = [
-            "open_time", "close_time", "open", "high", "low", "close",
-            "volume", "quote_volume", "count", "taker_buy_base_volume", "taker_buy_quote_volume"
+            "open_time",
+            "close_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_volume",
+            "count",
+            "taker_buy_base_volume",
+            "taker_buy_quote_volume",
         ]
-        
+
         await self.write_client.insert(self.table_name, data, column_names=column_names)
         logger.debug(f"WS 直写 {len(klines)} 条数据到 {self.table_name}")
 
-    async def _handle_message(self, msg: str | bytes):
+    # -------------------------------------------------------------------------
+    # message handler
+    # -------------------------------------------------------------------------
+    async def _handle_message(self, msg: str | bytes) -> None:
         try:
             if isinstance(msg, bytes):
                 obj_text = msg.decode("utf-8", errors="ignore")
             else:
                 obj_text = msg
+
             obj = json.loads(obj_text)
             k = obj.get("k")
             if not k:
-                return
-            if not k.get("x", False):
                 return
 
             kline = Kline(
@@ -253,6 +293,20 @@ class UpstreamStream:
                 taker_buy_base_volume=Decimal(k.get("V", "0")),
                 taker_buy_quote_volume=Decimal(k.get("Q", "0")),
             )
-            self._kline_batch.append(kline)
+
+            asyncio.create_task(
+                self.event_bus.publish(self.table_name, kline),
+                name=f"publish_{self.table_name}",
+            )
+
+            if k.get("x", False):
+                async with self._batch_lock:
+                    self._kline_batch.append(kline)
+
         except Exception as e:
-             logger.error("WS 消息处理失败：{} {} 错误={}", self.symbol, self.period, str(e))
+            logger.error(
+                "WS 消息处理失败：{} {} 错误={}",
+                self.symbol,
+                self.period,
+                str(e),
+            )
