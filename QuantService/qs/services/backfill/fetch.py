@@ -18,9 +18,9 @@ async def fetch_klines(
 ) -> Tuple[List[Kline], dict]:
     url = rest_url(cfg, market)
     params = build_params(symbol, period, start_ms, end_ms, limit)
-    proxies = {"all://": proxy_url} if proxy_url else None
+    transport = httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
     timeout = httpx.Timeout(10.0, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout, proxies=proxies) as client:
+    async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
         r = await client.get(url, params=params)
         r.raise_for_status()
         data = r.json()
