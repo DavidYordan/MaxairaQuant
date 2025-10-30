@@ -66,6 +66,9 @@ class BackfillManager:
         # 首先进行连接探测
         await self._test_market_connection(market, symbol, period)
         
+        # 预先获取代理URL，避免在并发窗口中重复查询
+        proxy_url = await self._select_proxy_url(market)
+        
         table = kline_table_name(symbol, market.value, period)
         windows = self._split_gap(gap_start_ms, gap_end_ms, period)
         
@@ -73,15 +76,15 @@ class BackfillManager:
             logger.info("没有需要回填的窗口")
             return
         
-        # 使用信号量控制并发
-        sem = asyncio.Semaphore(self._window_concurrency)
+        # 使用信号量控制并发，减少并发数
+        sem = asyncio.Semaphore(min(self._window_concurrency, 2))  # 最多2个并发窗口
         
         # 创建任务组
         async with asyncio.TaskGroup() as tg:
             tasks = []
             for i, (ws, we) in enumerate(windows):
                 task = tg.create_task(
-                    self._do_window_safe(sem, market, symbol, period, table, ws, we),
+                    self._do_window_safe(sem, market, symbol, period, table, ws, we, proxy_url),
                     name=f"window_{market}_{symbol}_{period}_{i}"
                 )
                 tasks.append(task)
@@ -89,23 +92,23 @@ class BackfillManager:
         logger.info(f"回填完成：{market} {symbol} {period} 处理了 {len(windows)} 个窗口")
 
     async def _do_window_safe(self, sem: asyncio.Semaphore, market: MarketType, 
-                             symbol: str, period: str, table: str, ws: int, we: int):
+                             symbol: str, period: str, table: str, ws: int, we: int, proxy_url: Optional[str]):
         """安全的窗口处理包装器"""
         try:
-            await self._do_window(sem, market, symbol, period, table, ws, we)
+            await self._do_window(sem, market, symbol, period, table, ws, we, proxy_url)
         except Exception as e:
             logger.error(f"窗口处理失败：{market} {symbol} {period} [{ws},{we}] 错误={e}")
             # 不重新抛出异常，让其他窗口继续处理
 
     async def _do_window(self, sem: asyncio.Semaphore, market: MarketType, 
-                        symbol: str, period: str, table: str, ws: int, we: int):
+                        symbol: str, period: str, table: str, ws: int, we: int, proxy_url: Optional[str]):
         """处理单个时间窗口的数据回填"""
         async with sem:  # 控制并发数
             # 获取API限流令牌
             await self.limiter.acquire()
             
             try:
-                proxy_url = await self._select_proxy_url(market)
+                # 使用预先获取的代理URL，避免重复查询数据库
                 self.metrics.inc_requests()
                 
                 # 获取数据

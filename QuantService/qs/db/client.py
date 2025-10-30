@@ -12,14 +12,20 @@ class AsyncClickHouseClient:
     提供异步 query / command / insert 接口，并保留简单并发控制
     """
 
-    def __init__(self, async_client: AsyncClient, pool_size: int = 10):
+    def __init__(self, async_client: AsyncClient, pool_size: int = 5):
         self._client = async_client
         self._semaphore = asyncio.Semaphore(pool_size)
+        self._query_lock = asyncio.Lock()  # 添加查询锁防止并发冲突
 
     async def query(self, query: str, parameters=None):
-        """异步查询"""
+        """异步查询 - 增强并发控制"""
         async with self._semaphore:
-            return await self._client.query(query=query, parameters=parameters)
+            # 对于简单查询使用锁来避免并发问题
+            if self._is_simple_query(query):
+                async with self._query_lock:
+                    return await self._client.query(query=query, parameters=parameters)
+            else:
+                return await self._client.query(query=query, parameters=parameters)
 
     async def command(self, cmd: str, parameters=None):
         """异步命令"""
@@ -34,6 +40,19 @@ class AsyncClickHouseClient:
                 data=data,
                 column_names=column_names,
             )
+
+    def _is_simple_query(self, query: str) -> bool:
+        """判断是否为简单查询（需要加锁保护）"""
+        query_lower = query.lower().strip()
+        # 对于配置查询和简单的SELECT使用锁
+        simple_patterns = [
+            'select host, port, username, password from proxy_config',
+            'select symbol, market_type from trading_pair_config',
+            'select count() from',
+            'select min(',
+            'select max(',
+        ]
+        return any(pattern in query_lower for pattern in simple_patterns)
 
     async def close(self):
         """关闭连接"""

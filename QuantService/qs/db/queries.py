@@ -147,24 +147,3 @@ async def insert_indicator_ma_incremental(
             "e": end_ms,
         },
     )
-
-async def get_latest_enabled_proxy(client: AsyncClickHouseClient) -> Tuple[str, int, str | None, str | None] | None:
-    """获取最新启用的代理配置"""
-    try:
-        rs = await client.query(
-            """SELECT host, port, username, password 
-            FROM proxy_config 
-            WHERE enabled = 1 
-            ORDER BY updated_at DESC 
-            LIMIT 1"""
-        )
-        
-        if not rs.result_rows:
-            return None
-            
-        host, port, username, password = rs.result_rows[0]
-        return str(host), int(port), (username or None), (password or None)
-        
-    except Exception as e:
-        logger.error(f"获取代理配置失败: {e}")
-        return None

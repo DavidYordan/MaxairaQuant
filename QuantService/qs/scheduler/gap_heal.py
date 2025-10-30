@@ -116,20 +116,51 @@ class GapHealScheduler:
         s_ms = step_ms(period)
         end_ms = int(time.time() * 1000)
         
-        # 获取启用的交易对
-        pairs = await get_enabled_pairs(self.client)
+        # 获取启用的交易对 - 添加重试机制
+        pairs = await self._get_enabled_pairs_with_retry()
+        
+        # 限制并发数量，避免过多的数据库连接
+        max_concurrent = min(len(pairs), 3)  # 最多3个并发
+        semaphore = asyncio.Semaphore(max_concurrent)
         
         # 并发处理所有交易对
         scan_tasks = []
         for symbol, market in pairs:
             task = asyncio.create_task(
-                self._scan_pair_with_strategy(symbol, market, period, end_ms, s_ms),
+                self._scan_pair_with_semaphore(semaphore, symbol, market, period, end_ms, s_ms),
                 name=f"scan_{market}_{symbol}_{period}"
             )
             scan_tasks.append(task)
         
         if scan_tasks:
-            await asyncio.gather(*scan_tasks, return_exceptions=True)
+            # 使用gather收集结果，忽略异常
+            results = await asyncio.gather(*scan_tasks, return_exceptions=True)
+            
+            # 记录异常
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    symbol, market = pairs[i]
+                    logger.error(f"扫描交易对失败 {market} {symbol} {period}: {result}")
+
+    async def _get_enabled_pairs_with_retry(self, max_retries: int = 3):
+        """获取启用的交易对，带重试机制"""
+        for attempt in range(max_retries):
+            try:
+                return await get_enabled_pairs(self.client)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"获取交易对失败，已重试{max_retries}次: {e}")
+                    raise
+                else:
+                    logger.warning(f"获取交易对失败，第{attempt + 1}次重试: {e}")
+                    await asyncio.sleep(1.0 * (attempt + 1))  # 递增延迟
+
+    async def _scan_pair_with_semaphore(self, semaphore: asyncio.Semaphore, 
+                                      symbol: str, market: str, period: str, 
+                                      end_ms: int, s_ms: int):
+        """使用信号量控制的交易对扫描"""
+        async with semaphore:
+            await self._scan_pair_with_strategy(symbol, market, period, end_ms, s_ms)
 
     async def _scan_pair_with_strategy(self, symbol: str, market: str, period: str, 
                                      end_ms: int, s_ms: int):
