@@ -53,6 +53,7 @@ class BackfillManager:
         logger.warning("启用代理用于市场：{}", market)
 
     async def backfill_gap(self, market: MarketType, symbol: str, period: str, gap_start_ms: int, gap_end_ms: int):
+        logger.info("开始回填缺口：{} {} {} 范围={}~{}", market, symbol, period, gap_start_ms, gap_end_ms)
         table = kline_table_name(symbol, market.value, period)
         ensure_kline_table(self.client, table)
         windows = self._split_gap(gap_start_ms, gap_end_ms, period)

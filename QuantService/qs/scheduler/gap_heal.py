@@ -43,12 +43,13 @@ class GapHealScheduler:
                     ensure_kline_table(self.client, table)
                     gaps = find_gaps_windowed_sql(self.client, table, start_ms, end_ms, s_ms)
                     if gaps:
-                        logger.info("发现缺口：{} {} {} 数量={}", market, symbol, period, len(gaps))
+                        logger.info("发现缺口：{} {} {} 数量={}, 范围={}~{}", market, symbol, period, len(gaps), gs, ge)
                     for (gs, ge) in gaps:
                         key = f"{market}|{symbol}|{period}"
                         if self._running_keys.get(key, False):
                             continue
                         self._running_keys[key] = True
+                        logger.info("开始填充缺口：{} {} {} 范围={}~{}", market, symbol, period, gs, ge)
                         asyncio.create_task(self._dispatch_and_release(key, market, symbol, period, gs, ge))
                 await asyncio.sleep(interval_s)
             except asyncio.CancelledError:
