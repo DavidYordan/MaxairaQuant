@@ -12,13 +12,13 @@ from ...services.backfill.fetch import fetch_klines
 from ...services.proxy.registry import get_enabled_proxy_url
 from ...db.schema import kline_table_name
 from ...monitoring.metrics import Metrics
-from ...db.client import AsyncClickHouseClient
+from ...db.client import ClickHouseClientManager
 
 class BackfillManager:
-    def __init__(self, cfg: AppConfig, ch_read_client: AsyncClickHouseClient, ch_backfill_client: AsyncClickHouseClient):
+    def __init__(self, cfg: AppConfig, clients: ClickHouseClientManager):
         self.cfg = cfg
-        self.read_client = ch_read_client
-        self.backfill_client = ch_backfill_client
+        self.clients = clients
+        self.read_client = clients.get_read()
         self.limiter = ApiRateLimiter(cfg.binance.requests_per_second)
         self._markets_using_proxy: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
         self._markets_tested: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
@@ -269,15 +269,7 @@ class BackfillManager:
         """确保数据缓冲区存在并已启动"""
         buf = self._buffers.get(table)
         if not buf:
-            buf = DataBuffer(
-                client=self.backfill_client, 
-                table_name=table, 
-                batch_size=3000,           # 回填使用更大批次
-                flush_interval_ms=2000,    # 2秒刷新间隔
-                event_bus=None,
-                writer_workers=6,          # 回填使用更多写入器
-                max_queue_size=30000       # 更大队列应对批量数据
-            )
+            buf = DataBuffer(table_name=table, clients=self.clients)
             self._buffers[table] = buf
             await buf.start()
             logger.info(f"创建数据缓冲区: {table}")

@@ -2,34 +2,26 @@ from __future__ import annotations
 import asyncio
 import clickhouse_connect
 from clickhouse_connect.driver.asyncclient import AsyncClient
-from ..config.schema import ClickHouseConfig
 from loguru import logger
-from dataclasses import dataclass
+from ..config.schema import ClickHouseConfig
 
 
 class AsyncClickHouseClient:
-    """
-    官方 AsyncClient 封装版本
-    提供异步 query / command / insert 接口，并保留简单并发控制
-    """
-
-    def __init__(self, async_client: AsyncClient, pool_size: int = 8):
+    """对官方 AsyncClient 的串行封装：同一连接上绝不并发"""
+    def __init__(self, async_client: AsyncClient):
         self._client = async_client
-        self._semaphore = asyncio.Semaphore(pool_size)
+        self._lock = asyncio.Lock()
 
     async def query(self, query: str, parameters=None):
-        """异步查询"""
-        async with self._semaphore:
+        async with self._lock:
             return await self._client.query(query=query, parameters=parameters)
 
     async def command(self, cmd: str, parameters=None):
-        """异步命令"""
-        async with self._semaphore:
+        async with self._lock:
             return await self._client.command(cmd=cmd, parameters=parameters)
 
     async def insert(self, table: str, data, column_names=None):
-        """异步插入"""
-        async with self._semaphore:
+        async with self._lock:
             return await self._client.insert(
                 table=table,
                 data=data,
@@ -37,98 +29,143 @@ class AsyncClickHouseClient:
             )
 
     async def close(self):
-        """关闭连接"""
         await self._client.close()
 
 
-@dataclass
-class ClickHouseClients:
-    read: AsyncClickHouseClient
-    write: AsyncClickHouseClient
-    backfill: AsyncClickHouseClient
+class ClickHouseClientManager:
+    """
+    负责：
+    - 启动时建必要的 read / write
+    - bulkwrite 按需创建：get_bulkwrite() 时没有就建，有就复用
+    - 限制 bulkwrite 最大数量
+    """
+    def __init__(self, cfg: ClickHouseConfig, max_bulkwrite: int = 4):
+        self.cfg = cfg
+        self.max_bulkwrite = max_bulkwrite
 
-async def get_clients(
-    cfg: ClickHouseConfig,
-    pool_read: int = 8,
-    pool_write: int = 8,
-    pool_backfill: int = 16,
-) -> ClickHouseClients:
-    """
-    创建三个 ClickHouse 客户端：read / write / backfill，对应不同并发池。
-    """
-    try:
-        # 步骤1：使用异步方式、临时客户端来确保数据库存在
-        # 这避免了在 async 函数中使用同步 IO，并隔离了引导操作
-        bootstrap_client_raw = None
-        try:
-            bootstrap_client_raw = await clickhouse_connect.get_async_client(
-                host=cfg.host,
-                port=cfg.port,
-                username=cfg.username,
-                password=cfg.password,
+        self._read: AsyncClickHouseClient | None = None
+        self._bulkread: AsyncClickHouseClient | None = None
+        self._write: AsyncClickHouseClient | None = None
+        self._bulkwrites: list[AsyncClickHouseClient] = []
+
+        self._init_lock = asyncio.Lock()
+        self._bulkwrite_lock = asyncio.Lock()
+
+    async def init_base(self):
+        """
+        确保库存在 + 创建基础的 read / bulkread / write
+        只会真正执行一次，其它协程进来会等这把锁
+        """
+        async with self._init_lock:
+            if self._read is not None:
+                return
+
+            # 1) 确保库存在
+            bootstrap = await clickhouse_connect.get_async_client(
+                host=self.cfg.host,
+                port=self.cfg.port,
+                username=self.cfg.username,
+                password=self.cfg.password,
                 database="default",
                 connect_timeout=10,
-                send_receive_timeout=30
+                send_receive_timeout=30,
             )
-            await bootstrap_client_raw.command(f"CREATE DATABASE IF NOT EXISTS {cfg.database}")
-            logger.info(f"✅ 数据库 '{cfg.database}' 已确认存在")
-        finally:
-            if bootstrap_client_raw:
-                await bootstrap_client_raw.close()
-        
-        # 稍微延迟，给予数据库准备时间，避免后续连接立即失败
-        await asyncio.sleep(0.1)
+            try:
+                await bootstrap.command(f"CREATE DATABASE IF NOT EXISTS {self.cfg.database}")
+            finally:
+                await bootstrap.close()
 
+            await asyncio.sleep(0.05)
+
+            def make_sync():
+                return clickhouse_connect.get_client(
+                    host=self.cfg.host,
+                    port=self.cfg.port,
+                    username=self.cfg.username,
+                    password=self.cfg.password,
+                    database=self.cfg.database,
+                    send_receive_timeout=30,
+                    connect_timeout=10,
+                    compress=True,
+                    query_limit=0,
+                )
+
+            self._read = AsyncClickHouseClient(AsyncClient(client=make_sync()))
+            self._bulkread = AsyncClickHouseClient(AsyncClient(client=make_sync()))
+            self._write = AsyncClickHouseClient(AsyncClient(client=make_sync()))
+
+            # 基础配置
+            base_cmds = [
+                "SET max_threads = 8",
+                "SET max_memory_usage = 4294967296",
+            ]
+            for cmd in base_cmds:
+                await asyncio.gather(
+                    self._read.command(cmd),
+                    self._bulkread.command(cmd),
+                    self._write.command(cmd),
+                )
+
+            logger.info("✅ ClickHouse base clients (read/bulkread/write) ready")
+
+    async def _make_bulkwrite(self) -> AsyncClickHouseClient:
+        """真正创建一条 bulkwrite 连接并做写配置"""
         def make_sync():
             return clickhouse_connect.get_client(
-                host=cfg.host,
-                port=cfg.port,
-                username=cfg.username,
-                password=cfg.password,
-                database=cfg.database,
-                send_receive_timeout=30,
+                host=self.cfg.host,
+                port=self.cfg.port,
+                username=self.cfg.username,
+                password=self.cfg.password,
+                database=self.cfg.database,
+                send_receive_timeout=60,
                 connect_timeout=10,
                 compress=True,
-                query_limit=0,
             )
 
-        # 分别创建三个独立的底层同步 client
-        sync_read = make_sync()
-        sync_write = make_sync()
-        sync_backfill = make_sync()
-
-        # 包装为 AsyncClient，再包为 AsyncClickHouseClient，并设置各自的并发池大小
-        read_client = AsyncClickHouseClient(AsyncClient(client=sync_read), pool_size=pool_read)
-        write_client = AsyncClickHouseClient(AsyncClient(client=sync_write), pool_size=pool_write)
-        backfill_client = AsyncClickHouseClient(AsyncClient(client=sync_backfill), pool_size=pool_backfill)
-
-        # 基础配置（对三个客户端都执行，确保一致性）
-        config_commands = [
+        cli = AsyncClickHouseClient(AsyncClient(client=make_sync()))
+        # 写配置可以更激进
+        write_cmds = [
             "SET async_insert = 1",
-            "SET wait_for_async_insert = 1",
+            "SET wait_for_async_insert = 0",   # 巨量写建议先不等
             "SET async_insert_max_data_size = 33554432",
             "SET async_insert_busy_timeout_ms = 1000",
             "SET async_insert_stale_timeout_ms = 2000",
             "SET max_threads = 8",
-            "SET max_memory_usage = 4294967296",
-            "SET max_insert_block_size = 8388608",
-            "SET min_insert_block_size_rows = 100000",
-            "SET min_insert_block_size_bytes = 67108864",
+            "SET max_memory_usage = 8589934592",  # 8G
             "SET network_compression_method = 'lz4'",
-            "SET max_concurrent_queries_for_user = 16",
         ]
+        for cmd in write_cmds:
+            await cli.command(cmd)
+        return cli
 
-        for cmd in config_commands:
-            await read_client.command(cmd)
-            await write_client.command(cmd)
-            await backfill_client.command(cmd)
+    async def get_read(self) -> AsyncClickHouseClient:
+        await self.init_base()
+        return self._read
 
-        logger.info("✅ ClickHouse 读/写/回填 三客户端初始化完成")
-        return ClickHouseClients(
-            read=read_client,
-            write=write_client,
-            backfill=backfill_client,
-        )
-    except Exception as e:
-        logger.error(f"❌ ClickHouse 多客户端初始化失败: {e}")
-        raise
+    async def get_bulkread(self) -> AsyncClickHouseClient:
+        await self.init_base()
+        return self._bulkread
+
+    async def get_write(self) -> AsyncClickHouseClient:
+        await self.init_base()
+        return self._write
+
+    async def get_bulkwrite(self) -> AsyncClickHouseClient:
+        """
+        如果已有 bulkwrite，就按轮询给一个；
+        如果还没建够 max_bulkwrite，就新建一个；
+        多协程同时进来靠 _bulkwrite_lock 保证只建一次。
+        """
+        await self.init_base()
+
+        async with self._bulkwrite_lock:
+            if self._bulkwrites:
+                # 简单返回最后一个，或者也可以 round-robin
+                cli = self._bulkwrites.pop(0)
+                self._bulkwrites.append(cli)
+                return cli
+
+            # 第一次进来，一个都没有，就建一条
+            cli = await self._make_bulkwrite()
+            self._bulkwrites.append(cli)
+            return cli

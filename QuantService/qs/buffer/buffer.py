@@ -4,14 +4,14 @@ import logging
 from typing import List, Optional
 from ..common.types import Kline
 from ..db.queries import insert_klines
-from ..services.ws.event_bus import EventBus
-from ..db.client import AsyncClickHouseClient
+from ..db.client import ClickHouseClientManager
 
 
 class DataBuffer:
-    def __init__(self, client: AsyncClickHouseClient, table_name: str, batch_size: int = 2000, flush_interval_ms: int = 1500, 
-                 event_bus: Optional[EventBus] = None, writer_workers: int = 4, max_queue_size: int = 20000):
-        self.client = client
+    def __init__(self, table_name: str, clients: ClickHouseClientManager, batch_size: int = 2000,
+                flush_interval_ms: int = 1500, writer_workers: int = 4, max_queue_size: int = 20000
+                 ):
+        self.clients = clients
         self.table_name = table_name
         self.batch_size = batch_size
         self.flush_interval_ms = flush_interval_ms
@@ -25,7 +25,6 @@ class DataBuffer:
         # 高性能写入队列配置
         self._write_q: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
         self._writer_tasks: List[asyncio.Task] = []  # 多个写入任务
-        self.event_bus = event_bus
         
         # 性能监控
         self._stats = {
@@ -106,7 +105,7 @@ class DataBuffer:
         """写入器工作循环 - 改进的错误处理和优雅停止"""
         self.logger.info(f"Writer {worker_id} 已启动")
         
-        while not self._stopped:
+        while True:
             try:
                 # 等待批次数据或停止信号
                 batch = await self._write_q.get()
@@ -185,7 +184,7 @@ class DataBuffer:
         for attempt in range(max_retries):
             try:
                 # 使用异步客户端直接调用
-                await insert_klines(self.client, self.table_name, batch)
+                await insert_klines(self.clients.get_write(), self.table_name, batch)
                 
                 # 更新统计信息（原子操作）
                 batch_size = len(batch)
@@ -194,18 +193,6 @@ class DataBuffer:
                     (self._stats['avg_batch_size'] * (self._stats['total_writes'] - 1) + batch_size) 
                     / self._stats['total_writes']
                 )
-                
-                # 异步发布事件通知
-                if self.event_bus:
-                    try:
-                        await self.event_bus.publish("klines_written", {
-                            "table": self.table_name,
-                            "count": batch_size,
-                            "worker_id": worker_id,
-                            "timestamp": asyncio.get_event_loop().time()
-                        })
-                    except Exception as e:
-                        self.logger.warning(f"事件发布失败: {e}")
                 
                 return  # 成功写入，退出重试循环
                 

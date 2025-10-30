@@ -2,7 +2,7 @@ import asyncio
 from pathlib import Path
 from loguru import logger
 from ..config.loader import load_config
-from ..db.client import get_clients
+from ..db.client import ClickHouseClientManager
 from ..db.schema import ensure_base_tables, ensure_bootstrap_defaults, ensure_indicator_tables, ensure_backtest_tables, ensure_indicator_views_for_pairs
 from ..db.queries import get_enabled_pairs
 from ..services.backfill.manager import BackfillManager
@@ -16,24 +16,24 @@ async def run_daemon(cfg_path: Path | str = None):
     # 1) 配置与DB
     cfg_path = cfg_path or (Path(__file__).parents[2] / "config" / "app.yaml")
     cfg = load_config(cfg_path)
-    clients = await get_clients(cfg.clickhouse, pool_read=8, pool_write=8, pool_backfill=16)
-    await ensure_base_tables(clients.write)
+    clients = ClickHouseClientManager(cfg.clickhouse)
+    await ensure_base_tables(clients.get_write())
     # 集中初始化：默认交易对与K线表
-    await ensure_bootstrap_defaults(clients.write, cfg.binance.assets)
+    await ensure_bootstrap_defaults(clients.get_write(), cfg.binance.assets)
     # 新增：指标与回测表的集中初始化
-    await ensure_indicator_tables(clients.write)
-    await ensure_backtest_tables(clients.write)
+    await ensure_indicator_tables(clients.get_write())
+    await ensure_backtest_tables(clients.get_write())
     # 初始化指标视图（根据启用的交易对与周期创建）
-    pairs = await get_enabled_pairs(clients.read)
-    await ensure_indicator_views_for_pairs(clients.write, pairs, ["1m", "1h"])
+    pairs = await get_enabled_pairs(clients.get_read())
+    await ensure_indicator_views_for_pairs(clients.get_write(), pairs, ["1m", "1h"])
 
     # 4) 组装各服务
     event_bus = EventBus()
-    backfill = BackfillManager(cfg, clients.read, clients.backfill)
-    scheduler = GapHealScheduler(cfg, clients.read, backfill)
-    ws_sup = WebSocketSupervisor(cfg, clients.read, clients.write, event_bus=event_bus)
-    ind_on = IndicatorOnlineService(clients.read, clients.write)
-    client_srv = ClientServer(clients.read, event_bus=event_bus)
+    backfill = BackfillManager(cfg, clients)
+    scheduler = GapHealScheduler(cfg, clients.get_read(), backfill)
+    ws_sup = WebSocketSupervisor(cfg, clients.get_read(), clients.get_write(), event_bus=event_bus)
+    ind_on = IndicatorOnlineService(clients.get_read(), clients.get_write())
+    client_srv = ClientServer(clients.get_read(), event_bus=event_bus)
 
     # 5) 启动顺序（所有 DB 初始化后再启动服务）
     await backfill.start()
