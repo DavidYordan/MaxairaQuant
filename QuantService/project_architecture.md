@@ -153,7 +153,7 @@ async def run_daemon(cfg_path: Path | str = None):
 #### BackfillManager - 核心回填管理器
 ```python
 class BackfillManager:
-    def __init__(self, cfg: AppConfig, ch_client, event_bus: Optional[EventBus] = None):
+    def __init__(self, cfg: AppConfig, ch_client):
         self.cfg = cfg
         self.client = ch_client
         self.limiter = ApiRateLimiter(cfg.binance.requests_per_second)

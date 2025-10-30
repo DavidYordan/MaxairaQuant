@@ -8,8 +8,9 @@ from ...gateways.binance_rest import step_ms
 from ...db.queries import insert_indicator_ma_incremental
 
 class IndicatorOnlineService:
-    def __init__(self, client: AsyncClickHouseClient, poll_interval_ms: int = 2000):
-        self.client = client
+    def __init__(self, read_client: AsyncClickHouseClient, write_client: AsyncClickHouseClient, poll_interval_ms: int = 2000):
+        self.read_client = read_client
+        self.write_client = write_client
         self.poll_interval_ms = poll_interval_ms
         self._tasks: List[asyncio.Task] = []
         self._cursors: Dict[str, int] = {}
@@ -19,7 +20,7 @@ class IndicatorOnlineService:
             for period in periods:
                 table = kline_table_name(symbol, market, period)
                 # 初始游标：派生表或源表的最大 open_time
-                max_time = await get_max_open_time(self.client, table)
+                max_time = await get_max_open_time(self.read_client, table)
                 self._cursors[table] = max(max_time, self._cursors.get(table, 0))
                 self._tasks.append(asyncio.create_task(self._loop(symbol, market, period)))
         return None
@@ -36,7 +37,7 @@ class IndicatorOnlineService:
         while True:
             try:
                 # 异步获取最新时间戳，避免阻塞
-                latest = await get_max_open_time(self.client, table)
+                latest = await get_max_open_time(self.read_client, table)
                 cursor = self._cursors.get(table, 0)
                 if latest > cursor:
                     start_ms = max(0, cursor - preheat_ms)
@@ -53,7 +54,7 @@ class IndicatorOnlineService:
         table = kline_table_name(symbol, market, period)
         # insert_indicator_ma_incremental 已经是异步函数，直接调用
         await insert_indicator_ma_incremental(
-            self.client,
+            self.write_client,
             table,
             symbol,
             market,

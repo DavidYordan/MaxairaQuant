@@ -2,7 +2,7 @@ import asyncio
 from pathlib import Path
 from loguru import logger
 from ..config.loader import load_config
-from ..db.client import get_client
+from ..db.client import get_clients
 from ..db.schema import ensure_base_tables, ensure_bootstrap_defaults, ensure_indicator_tables, ensure_backtest_tables, ensure_indicator_views_for_pairs
 from ..db.queries import get_enabled_pairs
 from ..services.backfill.manager import BackfillManager
@@ -16,24 +16,24 @@ async def run_daemon(cfg_path: Path | str = None):
     # 1) 配置与DB
     cfg_path = cfg_path or (Path(__file__).parents[2] / "config" / "app.yaml")
     cfg = load_config(cfg_path)
-    client = await get_client(cfg.clickhouse)  # 改为异步调用
-    await ensure_base_tables(client)
+    clients = await get_clients(cfg.clickhouse, pool_read=8, pool_write=8, pool_backfill=16)
+    await ensure_base_tables(clients.write)
     # 集中初始化：默认交易对与K线表
-    await ensure_bootstrap_defaults(client, cfg.binance.assets)
+    await ensure_bootstrap_defaults(clients.write, cfg.binance.assets)
     # 新增：指标与回测表的集中初始化
-    await ensure_indicator_tables(client)
-    await ensure_backtest_tables(client)
+    await ensure_indicator_tables(clients.write)
+    await ensure_backtest_tables(clients.write)
     # 初始化指标视图（根据启用的交易对与周期创建）
-    pairs = await get_enabled_pairs(client)
-    await ensure_indicator_views_for_pairs(client, pairs, ["1m", "1h"])
+    pairs = await get_enabled_pairs(clients.read)
+    await ensure_indicator_views_for_pairs(clients.write, pairs, ["1m", "1h"])
 
     # 4) 组装各服务
     event_bus = EventBus()
-    backfill = BackfillManager(cfg, client, event_bus=event_bus)
-    scheduler = GapHealScheduler(cfg, client, backfill)
-    ws_sup = WebSocketSupervisor(cfg, client, event_bus=event_bus)
-    ind_on = IndicatorOnlineService(client)
-    client_srv = ClientServer(client, event_bus=event_bus)
+    backfill = BackfillManager(cfg, clients.read, clients.backfill)
+    scheduler = GapHealScheduler(cfg, clients.read, backfill)
+    ws_sup = WebSocketSupervisor(cfg, clients.read, clients.write, event_bus=event_bus)
+    ind_on = IndicatorOnlineService(clients.read, clients.write)
+    client_srv = ClientServer(clients.read, event_bus=event_bus)
 
     # 5) 启动顺序（所有 DB 初始化后再启动服务）
     await backfill.start()
@@ -44,12 +44,68 @@ async def run_daemon(cfg_path: Path | str = None):
     logger.info("守护已启动：回填/缺口调度/WS/指标在线/ClientServer")
 
     # 6) 指标日志
+    # 事件循环延迟监测：每秒采样一次，metrics loop 每60秒汇总
+    loop_delay_stats = {"sum": 0.0, "count": 0, "max": 0.0}
+    async def _loop_delay_monitor():
+        loop = asyncio.get_running_loop()
+        interval = 1.0
+        next_t = loop.time() + interval
+        while True:
+            await asyncio.sleep(interval)
+            now = loop.time()
+            delay = max(0.0, now - next_t)  # 秒
+            loop_delay_stats["sum"] += delay
+            loop_delay_stats["count"] += 1
+            if delay > loop_delay_stats["max"]:
+                loop_delay_stats["max"] = delay
+            next_t = now + interval
+
     async def _metrics_loop():
         while True:
             snap = backfill.metrics.snapshot()
-            logger.info("Metrics: req={} ok={} fail={} rows={}",
-                        snap.requests, snap.successes, snap.failures, snap.inserted_rows)
+            # DataBuffer 堆积（Backfill + WS）
+            bf_buf_stats = backfill.get_buffer_statuses()
+            ws_buf_stats = {k: v.status() for k, v in ws_sup.buffers.items()}
+
+            def agg(buf_stats: dict):
+                total_q = sum(s.get("writer_queue_size", 0) for s in buf_stats.values())
+                max_q = max([s.get("writer_queue_size", 0) for s in buf_stats.values()] or [0])
+                workers = sum(s.get("writer_active_workers", 0) for s in buf_stats.values())
+                return total_q, max_q, workers
+
+            bf_total_q, bf_max_q, bf_workers = agg(bf_buf_stats)
+            ws_total_q, ws_max_q, ws_workers = agg(ws_buf_stats)
+
+            # EventBus 统计
+            eb_stats = event_bus.get_stats()
+            eb_topics = eb_stats.get("topics", 0)
+            eb_subs = eb_stats.get("subscribers", 0)
+            eb_queues = eb_stats.get("queues", 0)
+            eb_dropped = eb_stats.get("dropped", 0)
+            eb_delivered = eb_stats.get("delivered", 0)
+
+            # 事件循环延迟（ms）
+            cnt = max(1, loop_delay_stats["count"])
+            avg_ms = (loop_delay_stats["sum"] / cnt) * 1000.0
+            max_ms = loop_delay_stats["max"] * 1000.0
+            # 重置采样
+            loop_delay_stats["sum"] = 0.0
+            loop_delay_stats["count"] = 0
+            loop_delay_stats["max"] = 0.0
+
+            logger.info(
+                "Metrics: req={} ok={} fail={} rows={} | loop_delay(avg_ms={:.1f}, max_ms={:.1f}) | "
+                "BackfillQ(total={}, max={}, workers={}) | WSQ(total={}, max={}, workers={}) | "
+                "EventBus(topics={}, subs={}, queues={}, delivered={}, dropped={})",
+                snap.requests, snap.successes, snap.failures, snap.inserted_rows,
+                avg_ms, max_ms,
+                bf_total_q, bf_max_q, bf_workers,
+                ws_total_q, ws_max_q, ws_workers,
+                eb_topics, eb_subs, eb_queues, eb_delivered, eb_dropped
+            )
             await asyncio.sleep(60)
+
+    delay_task = asyncio.create_task(_loop_delay_monitor())
     asyncio.create_task(_metrics_loop())
 
     # 7) 常驻
@@ -61,3 +117,11 @@ async def run_daemon(cfg_path: Path | str = None):
         await ind_on.stop()
         await scheduler.stop()
         await backfill.stop()
+        # 关闭监控任务与数据库连接
+        delay_task.cancel()
+        try:
+            await clients.read.close()
+            await clients.write.close()
+            await clients.backfill.close()
+        except Exception as e:
+            logger.warning("关闭 ClickHouse 客户端失败: {}", e)

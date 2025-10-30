@@ -4,6 +4,7 @@ import clickhouse_connect
 from clickhouse_connect.driver.asyncclient import AsyncClient
 from ..config.schema import ClickHouseConfig
 from loguru import logger
+from dataclasses import dataclass
 
 
 class AsyncClickHouseClient:
@@ -12,20 +13,14 @@ class AsyncClickHouseClient:
     提供异步 query / command / insert 接口，并保留简单并发控制
     """
 
-    def __init__(self, async_client: AsyncClient, pool_size: int = 5):
+    def __init__(self, async_client: AsyncClient, pool_size: int = 8):
         self._client = async_client
         self._semaphore = asyncio.Semaphore(pool_size)
-        self._query_lock = asyncio.Lock()  # 添加查询锁防止并发冲突
 
     async def query(self, query: str, parameters=None):
-        """异步查询 - 增强并发控制"""
+        """异步查询"""
         async with self._semaphore:
-            # 对于简单查询使用锁来避免并发问题
-            if self._is_simple_query(query):
-                async with self._query_lock:
-                    return await self._client.query(query=query, parameters=parameters)
-            else:
-                return await self._client.query(query=query, parameters=parameters)
+            return await self._client.query(query=query, parameters=parameters)
 
     async def command(self, cmd: str, parameters=None):
         """异步命令"""
@@ -41,31 +36,28 @@ class AsyncClickHouseClient:
                 column_names=column_names,
             )
 
-    def _is_simple_query(self, query: str) -> bool:
-        """判断是否为简单查询（需要加锁保护）"""
-        query_lower = query.lower().strip()
-        # 对于配置查询和简单的SELECT使用锁
-        simple_patterns = [
-            'select host, port, username, password from proxy_config',
-            'select symbol, market_type from trading_pair_config',
-            'select count() from',
-            'select min(',
-            'select max(',
-        ]
-        return any(pattern in query_lower for pattern in simple_patterns)
-
     async def close(self):
         """关闭连接"""
         await self._client.close()
 
 
-async def get_client(cfg: ClickHouseConfig) -> AsyncClickHouseClient:
+@dataclass
+class ClickHouseClients:
+    read: AsyncClickHouseClient
+    write: AsyncClickHouseClient
+    backfill: AsyncClickHouseClient
+
+async def get_clients(
+    cfg: ClickHouseConfig,
+    pool_read: int = 8,
+    pool_write: int = 8,
+    pool_backfill: int = 16,
+) -> ClickHouseClients:
     """
-    初始化 ClickHouse 异步客户端
-    使用官方 AsyncClient 封装
+    创建三个 ClickHouse 客户端：read / write / backfill，对应不同并发池。
     """
     try:
-        # 步骤1：确保数据库存在（使用 default 数据库临时连接）
+        # 先确保数据库存在（default 库上做）
         bootstrap = clickhouse_connect.get_client(
             host=cfg.host,
             port=cfg.port,
@@ -75,30 +67,33 @@ async def get_client(cfg: ClickHouseConfig) -> AsyncClickHouseClient:
             send_receive_timeout=30,
             connect_timeout=10,
         )
-
         bootstrap.command(f"CREATE DATABASE IF NOT EXISTS {cfg.database}")
         bootstrap.close()
 
-        # 步骤2：创建主同步 Client
-        sync_client = clickhouse_connect.get_client(
-            host=cfg.host,
-            port=cfg.port,
-            username=cfg.username,
-            password=cfg.password,
-            database=cfg.database,
-            send_receive_timeout=30,
-            connect_timeout=10,
-            compress=True,
-            query_limit=0,
-        )
+        def make_sync():
+            return clickhouse_connect.get_client(
+                host=cfg.host,
+                port=cfg.port,
+                username=cfg.username,
+                password=cfg.password,
+                database=cfg.database,
+                send_receive_timeout=30,
+                connect_timeout=10,
+                compress=True,
+                query_limit=0,
+            )
 
-        # 步骤3：创建官方 AsyncClient
-        async_client = AsyncClient(client=sync_client)
+        # 分别创建三个独立的底层同步 client
+        sync_read = make_sync()
+        sync_write = make_sync()
+        sync_backfill = make_sync()
 
-        # 步骤4：创建封装包装器
-        client = AsyncClickHouseClient(async_client)
+        # 包装为 AsyncClient，再包为 AsyncClickHouseClient，并设置各自的并发池大小
+        read_client = AsyncClickHouseClient(AsyncClient(client=sync_read), pool_size=pool_read)
+        write_client = AsyncClickHouseClient(AsyncClient(client=sync_write), pool_size=pool_write)
+        backfill_client = AsyncClickHouseClient(AsyncClient(client=sync_backfill), pool_size=pool_backfill)
 
-        # 步骤5：依次执行配置命令（不可并发，因为底层连接非线程安全）
+        # 基础配置（对三个客户端都执行，确保一致性）
         config_commands = [
             "SET async_insert = 1",
             "SET wait_for_async_insert = 1",
@@ -115,11 +110,16 @@ async def get_client(cfg: ClickHouseConfig) -> AsyncClickHouseClient:
         ]
 
         for cmd in config_commands:
-            await client.command(cmd)
+            await read_client.command(cmd)
+            await write_client.command(cmd)
+            await backfill_client.command(cmd)
 
-        logger.info("✅ ClickHouse 异步客户端初始化完成")
-        return client
-
+        logger.info("✅ ClickHouse 读/写/回填 三客户端初始化完成")
+        return ClickHouseClients(
+            read=read_client,
+            write=write_client,
+            backfill=backfill_client,
+        )
     except Exception as e:
-        logger.error(f"❌ ClickHouse 客户端初始化失败: {e}")
+        logger.error(f"❌ ClickHouse 多客户端初始化失败: {e}")
         raise

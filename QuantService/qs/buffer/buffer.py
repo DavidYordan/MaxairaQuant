@@ -19,7 +19,6 @@ class DataBuffer:
         self.max_queue_size = max_queue_size
         
         self._buf: List[Kline] = []
-        self._lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
         self._stopped = False  # 添加停止标志
         
@@ -131,28 +130,25 @@ class DataBuffer:
         self.logger.info(f"Writer {worker_id} 已停止")
 
     async def add(self, k: Kline):
-        async with self._lock:
-            self._buf.append(k)
-            if len(self._buf) >= self.batch_size:
-                await self.flush()
+        self._buf.append(k)
+        if len(self._buf) >= self.batch_size:
+            await self.flush()
 
     async def add_many(self, items: List[Kline]):
         """批量添加数据，提高效率"""
-        async with self._lock:
-            self._buf.extend(items)
-            # 如果缓冲区过大，分批刷新
-            while len(self._buf) >= self.batch_size:
-                batch = self._buf[:self.batch_size]
-                self._buf = self._buf[self.batch_size:]
-                await self._queue_write(batch)
+        self._buf.extend(items)
+        # 如果缓冲区过大，分批刷新
+        while len(self._buf) >= self.batch_size:
+            batch = self._buf[:self.batch_size]
+            self._buf = self._buf[self.batch_size:]
+            await self._queue_write(batch)
 
     async def flush(self):
         """刷新缓冲区到写入队列"""
-        async with self._lock:
-            if self._buf:
-                batch = self._buf.copy()
-                self._buf.clear()
-                await self._queue_write(batch)
+        if self._buf:
+            batch = self._buf.copy()
+            self._buf.clear()
+            await self._queue_write(batch)
 
     async def _queue_write(self, batch: List[Kline]):
         """将批次加入写入队列，处理队列满的情况"""

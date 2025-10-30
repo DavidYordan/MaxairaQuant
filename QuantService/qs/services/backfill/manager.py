@@ -6,25 +6,25 @@ from ...buffer.buffer import DataBuffer
 from ...common.types import MarketType
 from ...config.schema import AppConfig
 from ...gateways.binance_rest import step_ms
+from ...services.backfill.fetch import aclose_all_clients
 from ...services.backfill.rate_limiter import ApiRateLimiter
 from ...services.backfill.fetch import fetch_klines
 from ...services.proxy.registry import get_enabled_proxy_url
 from ...db.schema import kline_table_name
 from ...monitoring.metrics import Metrics
-from ...services.ws.event_bus import EventBus
 from ...db.client import AsyncClickHouseClient
 
 class BackfillManager:
-    def __init__(self, cfg: AppConfig, ch_client: AsyncClickHouseClient, event_bus: Optional[EventBus] = None):
+    def __init__(self, cfg: AppConfig, ch_read_client: AsyncClickHouseClient, ch_backfill_client: AsyncClickHouseClient):
         self.cfg = cfg
-        self.client = ch_client
+        self.read_client = ch_read_client
+        self.backfill_client = ch_backfill_client
         self.limiter = ApiRateLimiter(cfg.binance.requests_per_second)
         self._markets_using_proxy: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
         self._markets_tested: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
         self._window_concurrency = cfg.backfill.concurrency_windows
         self.metrics = Metrics()
         self._buffers: Dict[str, DataBuffer] = {}
-        self._event_bus = event_bus
 
     async def start(self):
         """启动回填管理器"""
@@ -57,6 +57,10 @@ class BackfillManager:
                 logger.warning("部分缓冲区停止超时")
         
         self._buffers.clear()
+
+        # 回收 HTTP 客户端池
+        await aclose_all_clients()
+
         logger.info("BackfillManager 已停止")
 
     async def backfill_gap(self, market: MarketType, symbol: str, period: str, gap_start_ms: int, gap_end_ms: int):
@@ -197,7 +201,7 @@ class BackfillManager:
     async def _select_proxy_url(self, market: MarketType) -> Optional[str]:
         """选择代理URL"""
         if self._markets_using_proxy.get(market, False):
-            return await get_enabled_proxy_url(self.client)
+            return await get_enabled_proxy_url(self.read_client)
         return None
 
     def enable_proxy_for_market(self, market: MarketType):
@@ -265,13 +269,12 @@ class BackfillManager:
         """确保数据缓冲区存在并已启动"""
         buf = self._buffers.get(table)
         if not buf:
-            # 创建缓冲区，使用优化的默认参数
             buf = DataBuffer(
-                client=self.client, 
+                client=self.backfill_client, 
                 table_name=table, 
                 batch_size=3000,           # 回填使用更大批次
                 flush_interval_ms=2000,    # 2秒刷新间隔
-                event_bus=self._event_bus,
+                event_bus=None,
                 writer_workers=6,          # 回填使用更多写入器
                 max_queue_size=30000       # 更大队列应对批量数据
             )
@@ -297,3 +300,7 @@ class BackfillManager:
             status = code.status_code if code is not None else None
             self.metrics.inc_failures()
             logger.error("代理重试失败：{} {} {} [{},{}] 状态={} 错误={}", market, symbol, period, ws, we, status, str(e))
+
+    def get_buffer_statuses(self) -> Dict[str, dict]:
+        """用于指标采集的缓冲区状态快照"""
+        return {table: buf.status() for table, buf in self._buffers.items()}

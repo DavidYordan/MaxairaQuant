@@ -12,30 +12,28 @@ class ProxyRegistry:
     def __init__(self):
         self._cache: Optional[Tuple[str, int, str, str, float]] = None  # (host, port, username, password, cache_time)
         self._cache_ttl = 60.0  # 缓存60秒
-        self._lock = asyncio.Lock()
     
     async def get_enabled_proxy_url(self, client: AsyncClickHouseClient) -> Optional[str]:
         """获取启用的代理URL，带缓存机制"""
         try:
-            async with self._lock:
-                now = time.time()
-                
-                # 检查缓存是否有效
-                if self._cache and (now - self._cache[4]) < self._cache_ttl:
-                    host, port, username, password = self._cache[:4]
-                    return self._build_proxy_url(host, port, username, password)
-                
-                # 缓存过期或不存在，重新查询
-                rec = await self._get_latest_enabled_proxy_safe(client)
-                if rec is None:
-                    self._cache = None
-                    return None
-                
-                host, port, username, password = rec
-                # 更新缓存
-                self._cache = (host, port, username, password, now)
-                
+            now = time.time()
+            
+            # 检查缓存是否有效
+            if self._cache and (now - self._cache[4]) < self._cache_ttl:
+                host, port, username, password = self._cache[:4]
                 return self._build_proxy_url(host, port, username, password)
+            
+            # 缓存过期或不存在，重新查询
+            rec = await self._get_latest_enabled_proxy_safe(client)
+            if rec is None:
+                self._cache = None
+                return None
+            
+            host, port, username, password = rec
+            # 更新缓存
+            self._cache = (host, port, username, password, now)
+            
+            return self._build_proxy_url(host, port, username, password)
                 
         except Exception as e:
             logger.error(f"获取代理URL失败: {e}")

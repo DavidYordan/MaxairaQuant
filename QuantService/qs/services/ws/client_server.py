@@ -186,12 +186,31 @@ class ClientServer:
         return json.loads(text)
 
     async def _send(self, ws: websockets.WebSocketServerProtocol, payload: Any, compression: Optional[str]):
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # 依据 payload 大小/压缩选择是否将 CPU 重活卸载到线程
+        use_thread = False
+        if isinstance(payload, dict):
+            rows = payload.get("rows")
+            if isinstance(rows, list) and len(rows) >= 200:
+                use_thread = True
         if compression == "gzip":
-            data = gzip.compress(data)
-            await ws.send(data)  # 二进制帧
+            use_thread = True
+
+        if use_thread:
+            import functools
+            # 序列化
+            text = await asyncio.to_thread(json.dumps, payload, ensure_ascii=False)
+            if compression == "gzip":
+                data = await asyncio.to_thread(lambda b: gzip.compress(b), text.encode("utf-8"))
+                await ws.send(data)  # 二进制帧
+            else:
+                await ws.send(text)  # 文本帧
         else:
-            await ws.send(data.decode("utf-8"))
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            if compression == "gzip":
+                data = gzip.compress(data)
+                await ws.send(data)  # 二进制帧
+            else:
+                await ws.send(data.decode("utf-8"))
 
     async def _handle_query(self, req: Dict[str, Any]) -> Dict[str, Any]:
         symbol = req["symbol"]

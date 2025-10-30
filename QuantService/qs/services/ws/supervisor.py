@@ -12,9 +12,10 @@ from ...db.queries import get_enabled_pairs
 from .event_bus import EventBus
 
 class WebSocketSupervisor:
-    def __init__(self, cfg: AppConfig, ch_client: AsyncClickHouseClient, event_bus: EventBus | None = None):
+    def __init__(self, cfg: AppConfig, ch_read_client: AsyncClickHouseClient, ch_write_client: AsyncClickHouseClient, event_bus: EventBus | None = None):
         self.cfg = cfg
-        self.client = ch_client
+        self.read_client = ch_read_client
+        self.write_client = ch_write_client
         self.streams: Dict[str, UpstreamStream] = {}
         self.buffers: Dict[str, DataBuffer] = {}
         self.status: Dict[str, str] = {}
@@ -31,7 +32,7 @@ class WebSocketSupervisor:
         if not buf:
             # 创建缓冲区，使用优化的默认参数
             buf = DataBuffer(
-                client=self.client, 
+                client=self.write_client, 
                 table_name=table, 
                 batch_size=2000,           # 优化的批次大小
                 flush_interval_ms=1500,    # 1.5秒刷新间隔
@@ -67,7 +68,7 @@ class WebSocketSupervisor:
         logger.info("WS 流已停止：{}", key)
 
     async def start_enabled_streams(self):
-        pairs = await get_enabled_pairs(self.client)
+        pairs = await get_enabled_pairs(self.read_client)
         for symbol, market in pairs:
             await self.start_stream(market, symbol, "1m")
             await self.start_stream(market, symbol, "1h")

@@ -1,7 +1,7 @@
 import argparse
 import asyncio
 from config.loader import load_config
-from db.client import get_client
+from db.client import get_clients
 from loguru import logger
 from services.backfill.manager import BackfillManager
 from services.ws.supervisor import WebSocketSupervisor
@@ -37,16 +37,16 @@ def main():
 
     async def run():
         """主运行函数 - 改进的异步生命周期管理"""
-        client = None
+        clients = None
         services = []
         
         try:
-            # 初始化数据库客户端
-            client = await get_client(cfg.clickhouse)
+            # 初始化数据库客户端（三个池）
+            clients = await get_clients(cfg.clickhouse, pool_read=8, pool_write=8, pool_backfill=16)
             bus = EventBus()
             
             if args.cmd == "clientserver":
-                srv = ClientServer(client, host=args.host, port=args.port, qps=args.qps, event_bus=bus)
+                srv = ClientServer(clients.read, host=args.host, port=args.port, qps=args.qps, event_bus=bus)
                 services.append(srv)
                 await srv.start()
                 
@@ -74,9 +74,8 @@ def main():
                     logger.info("收到键盘中断")
                 
             elif args.cmd == "backfill-gap":
-                mgr = BackfillManager(cfg, client, event_bus=bus)
+                mgr = BackfillManager(cfg, clients.read, clients.backfill)
                 services.append(mgr)
-                
                 await mgr.start()
                 await mgr.backfill_gap(
                     MarketType(args.market), 
@@ -85,11 +84,9 @@ def main():
                     args.start_ms, 
                     args.end_ms
                 )
-                
             elif args.cmd == "ws-start":
-                sup = WebSocketSupervisor(cfg, client, event_bus=bus)
+                sup = WebSocketSupervisor(cfg, clients.read, clients.write, event_bus=bus)
                 services.append(sup)
-                
                 await sup.start_stream(args.market, args.symbol, args.period)
                 logger.info(f"WebSocket流已启动: {args.market} {args.symbol} {args.period}")
                 
@@ -103,7 +100,6 @@ def main():
         except Exception as e:
             logger.error(f"运行时错误: {e}")
             raise
-            
         finally:
             # 优雅关闭所有服务
             logger.info("正在关闭服务...")
@@ -127,13 +123,14 @@ def main():
                     logger.warning("部分服务关闭超时")
             
             # 关闭数据库客户端
-            if client and hasattr(client, 'close'):
+            if clients:
                 try:
-                    client.close()
+                    await clients.read.close()
+                    await clients.write.close()
+                    await clients.backfill.close()
                     logger.info("数据库连接已关闭")
                 except Exception as e:
                     logger.error(f"关闭数据库连接失败: {e}")
-            
             logger.info("所有服务已关闭")
 
     asyncio.run(run())
