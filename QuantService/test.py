@@ -27,7 +27,7 @@ async def main():
         try:
             resp = await client.get(URL, params=PARAMS)
             print(f"状态码: {resp.status_code}")
-            print("响应内容:")
+            print("响应内容:", resp.json())
         except Exception as e:
             print("请求出错:", e)
 
