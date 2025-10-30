@@ -37,6 +37,18 @@ class GapHealScheduler:
         # 去重控制：以“缺口范围”为维度标记
         self._running_keys: Dict[str, bool] = {}
 
+        # 额外去重：按交易对/周期维度，记录正在处理的区间，防止重叠派发
+        from typing import Tuple
+        self._running_ranges: Dict[str, List[Tuple[int, int]]] = {}
+
+        # 高水位注册表：按交易对/市场/周期维度维护
+        self._hwm: Dict[str, int] = {}
+        try:
+            self._default_start_ms = int(time.mktime(time.strptime(self.cfg.binance.historical_start_dates, "%Y-%m-%d")) * 1000)
+        except Exception:
+            # 配置异常时，退化为回看 7 天
+            self._default_start_ms = int(time.time() * 1000) - 7 * 24 * 60 * 60 * 1000
+
         # 回看步数：容忍迟到写入与小范围波动（可按需调整）
         self._lookback_steps = 5
 
@@ -145,28 +157,35 @@ class GapHealScheduler:
                 logger.warning(f"获取交易对失败，第{attempt + 1}次重试: {e}")
                 await asyncio.sleep(1.0 * (attempt + 1))
 
+    # —— 新增：水位管理与辅助工具 —— #
+    def _group_key(self, market: str, symbol: str, period: str) -> str:
+        return f"{market}|{symbol}|{period}".lower()
+
+    def _get_hwm(self, market: str, symbol: str, period: str) -> int:
+        k = self._group_key(market, symbol, period)
+        return self._hwm.get(k, self._default_start_ms)
+
+    def _set_hwm(self, market: str, symbol: str, period: str, new_ms: int) -> None:
+        k = self._group_key(market, symbol, period)
+        prev = self._hwm.get(k, self._default_start_ms)
+        self._hwm[k] = max(prev, new_ms)
+
+    @staticmethod
+    def _align_step(ms: int, step_ms: int) -> int:
+        return (ms // step_ms) * step_ms
+
+    @staticmethod
+    def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+        return not (a_end < b_start or a_start > b_end)
+
     async def _scan_pair(self, sem: asyncio.Semaphore, symbol: str, market: str, period: str, s_ms: int, end_ms: int):
         async with sem:
             table = kline_table_name(symbol, market, period)
 
-            # 读取水位：当前表内最大 open_time
-            try:
-                last_ot = await get_max_open_time(self.client, table)
-            except Exception as e:
-                logger.error(f"读取水位失败 {market} {symbol} {period}: {e}")
-                return
-
-            # 计算扫描起点：从水位回看少量步数，容忍迟到写入
-            if last_ot and last_ot > 0:
-                start_ms = max(last_ot - self._lookback_steps * s_ms, 0)
-            else:
-                # 表为空：从配置中的历史起点开始
-                try:
-                    start_ms = int(time.mktime(time.strptime(self.cfg.binance.historical_start_dates, "%Y-%m-%d")) * 1000)
-                except Exception:
-                    # 配置异常时，退化为回看 7 天
-                    start_ms = end_ms - 7 * 24 * 60 * 60 * 1000
-
+            # 使用高水位注册表作为扫描起点（参考 Java 逻辑）
+            start_ms = self._align_step(self._get_hwm(market, symbol, period), s_ms)
+            # 轻微回看以容忍迟到写入（同步到步长）
+            start_ms = max(start_ms - self._lookback_steps * s_ms, 0)
             start_ms = min(start_ms, end_ms)
             if start_ms >= end_ms:
                 return
@@ -178,23 +197,34 @@ class GapHealScheduler:
                 logger.error(f"缺口查询失败 {market} {symbol} {period}: {e}")
                 return
 
+            group = self._group_key(market, symbol, period)
+            running = self._running_ranges.get(group, [])
+
             if not gaps:
-                logger.debug(f"无缺口：{market} {symbol} {period} 范围={start_ms}~{end_ms}")
+                # 窗口内无缺口：抬高大水位至尾端+步长（逐步靠近最大值）
+                self._set_hwm(market, symbol, period, end_ms + s_ms)
+                logger.debug(f"无缺口：{market} {symbol} {period} 范围={start_ms}~{end_ms}，水位更新为 {self._get_hwm(market, symbol, period)}")
                 return
 
-            # 按缺口维度派发回填任务（包含范围去重）
+            # 按缺口维度派发回填任务，增加“重叠区间防重复”
             for gs, ge in gaps:
+                # 如果与当前正在处理的区间有重叠，则跳过，避免重复子集/重叠区间
+                overlapped = any(self._overlaps(gs, ge, rgs, rge) for (rgs, rge) in running)
+                if overlapped:
+                    continue
+
                 key = f"{market}|{symbol}|{period}|{gs}|{ge}"
                 if self._running_keys.get(key, False):
                     continue
 
                 self._running_keys[key] = True
+                self._running_ranges.setdefault(group, []).append((gs, ge))
                 asyncio.create_task(
-                    self._dispatch_and_release(key, market, symbol, period, gs, ge),
+                    self._dispatch_and_release(key, group, market, symbol, period, gs, ge),
                     name=f"heal_{market}_{symbol}_{period}_{gs}_{ge}"
                 )
 
-    async def _dispatch_and_release(self, key: str, market: str, symbol: str, period: str, gs: int, ge: int):
+    async def _dispatch_and_release(self, key: str, group: str, market: str, symbol: str, period: str, gs: int, ge: int):
         try:
             # 将并发限制用于实际执行阶段，避免任务泛滥
             async with self._task_semaphore:
@@ -206,4 +236,16 @@ class GapHealScheduler:
         except Exception as e:
             logger.error(f"回填失败：{market} {symbol} {period} [{gs},{ge}] 错误={e}")
         finally:
+            # 去重标记释放
             self._running_keys.pop(key, None)
+            # 区间去重释放
+            ranges = self._running_ranges.get(group)
+            if ranges is not None:
+                try:
+                    ranges.remove((gs, ge))
+                except ValueError:
+                    # 若对象不在列表（例如边界被调整），以重叠关系清理
+                    ranges = [r for r in ranges if not self._overlaps(gs, ge, r[0], r[1])]
+                    self._running_ranges[group] = ranges
+                if not ranges:
+                    self._running_ranges.pop(group, None)
