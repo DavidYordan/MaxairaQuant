@@ -201,9 +201,7 @@ class GapHealScheduler:
             running = self._running_ranges.get(group, [])
 
             if not gaps:
-                # 窗口内无缺口：抬高大水位至尾端+步长（逐步靠近最大值）
                 self._set_hwm(market, symbol, period, end_ms + s_ms)
-                logger.debug(f"无缺口：{market} {symbol} {period} 范围={start_ms}~{end_ms}，水位更新为 {self._get_hwm(market, symbol, period)}")
                 return
 
             # 按缺口维度派发回填任务，增加“重叠区间防重复”

@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 from typing import List, Optional, Tuple, Dict
 from loguru import logger
+import time
 from ...buffer.buffer import DataBuffer
 from ...common.types import MarketType
 from ...config.schema import AppConfig
@@ -137,10 +138,10 @@ class BackfillManager:
                     self.metrics.inc_successes()
                     self.metrics.add_inserted_rows(len(klines))
                     logger.debug(
-                        f"窗口成功：{market} {symbol} {period} [{ws},{we}] 写入 {len(klines)} 行"
+                        f"窗口成功：{market} {symbol} {period} [{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ws/1000))},{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(we/1000))}] 写入 {len(klines)} 行"
                     )
                 else:
-                    logger.warning(f"窗口无数据：{market} {symbol} {period} [{ws},{we}]")
+                    logger.warning(f"窗口无数据：{market} {symbol} {period} [{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ws/1000))},{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(we/1000))}]")
                     
             except Exception as e:
                 await self._handle_window_error(e, market, symbol, period, table, ws, we)
