@@ -65,7 +65,6 @@ async def run_daemon(cfg_path: Path | str = None):
             snap = backfill.metrics.snapshot()
             # DataBuffer 堆积（Backfill + WS）
             bf_buf_stats = backfill.get_buffer_statuses()
-            ws_buf_stats = {k: v.status() for k, v in ws_sup.buffers.items()}
 
             def agg(buf_stats: dict):
                 total_q = sum(s.get("writer_queue_size", 0) for s in buf_stats.values())
@@ -74,7 +73,6 @@ async def run_daemon(cfg_path: Path | str = None):
                 return total_q, max_q, workers
 
             bf_total_q, bf_max_q, bf_workers = agg(bf_buf_stats)
-            ws_total_q, ws_max_q, ws_workers = agg(ws_buf_stats)
 
             # EventBus 统计
             eb_stats = event_bus.get_stats()
