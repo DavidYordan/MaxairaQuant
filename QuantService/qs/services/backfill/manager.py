@@ -11,17 +11,18 @@ from ...services.backfill.fetch import fetch_klines
 from ...services.proxy.registry import get_enabled_proxy_url
 from ...db.schema import ensure_kline_table, kline_table_name
 from ...monitoring.metrics import Metrics
+from ...services.ws.event_bus import EventBus
 
 class BackfillManager:
-    def __init__(self, cfg: AppConfig, ch_client):
+    def __init__(self, cfg: AppConfig, ch_client, event_bus: Optional[EventBus] = None):
         self.cfg = cfg
         self.client = ch_client
         self.limiter = ApiRateLimiter(cfg.binance.requests_per_second)
         self._markets_using_proxy: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
         self._window_concurrency = cfg.backfill.concurrency_windows
         self.metrics = Metrics()
-        # 统一写入缓冲：每表一个 DataBuffer
         self._buffers: Dict[str, DataBuffer] = {}
+        self._event_bus = event_bus
 
     async def start(self):
         await self.limiter.start()
@@ -64,7 +65,7 @@ class BackfillManager:
     async def _ensure_buffer(self, table: str):
         buf = self._buffers.get(table)
         if not buf:
-            buf = DataBuffer(self.client, table, self.cfg.buffer.batch_size, self.cfg.buffer.flush_interval_ms)
+            buf = DataBuffer(self.client, table, self.cfg.buffer.batch_size, self.cfg.buffer.flush_interval_ms, event_bus=self._event_bus)
             self._buffers[table] = buf
             await buf.start()
         return buf

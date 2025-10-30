@@ -3,10 +3,11 @@ import asyncio
 from typing import List, Optional
 from ..common.types import Kline
 from ..db.queries import insert_klines
+from ..services.ws.event_bus import EventBus
 
 
 class DataBuffer:
-    def __init__(self, client, table_name: str, batch_size: int, flush_interval_ms: int):
+    def __init__(self, client, table_name: str, batch_size: int, flush_interval_ms: int, event_bus: Optional[EventBus] = None):
         self.client = client
         self.table_name = table_name
         self.batch_size = batch_size
@@ -17,6 +18,7 @@ class DataBuffer:
         # 后台写入队列与任务（解耦合阻塞 IO）
         self._write_q: asyncio.Queue = asyncio.Queue(maxsize=self.batch_size * 4)
         self._writer_task: Optional[asyncio.Task] = None
+        self.event_bus = event_bus
 
     async def start(self):
         if self._task is None:
@@ -89,6 +91,9 @@ class DataBuffer:
             try:
                 # 将 ClickHouse 同步写入放到线程池，避免阻塞事件循环
                 await asyncio.to_thread(insert_klines, self.client, self.table_name, batch)
+                # 写入成功后发布事件（用于客户端推送）
+                if self.event_bus:
+                    await self.event_bus.publish(self.table_name, batch)
                 return
             except Exception as e:
                 logger.warning("写入重试 {}/{} 失败：{} {}", attempt, max_retries, self.table_name, str(e))

@@ -1,7 +1,6 @@
 from __future__ import annotations
 from clickhouse_connect.driver.client import Client
 
-
 def ensure_base_tables(client: Client) -> None:
     client.command(
         """
@@ -33,16 +32,13 @@ def ensure_base_tables(client: Client) -> None:
         ORDER BY (host, port)
         """
     )
-    # 新增 API Key 管理表（用于 ClientServer 鉴权与连接级限速）
     client.command(
         """
         CREATE TABLE IF NOT EXISTS api_keys
         (
-          id UInt64,
           api_key String,
-          name String,
-          qps_limit UInt16 DEFAULT 20,
           enabled UInt8,
+          qps_limit UInt32,
           created_at DateTime DEFAULT now(),
           updated_at DateTime DEFAULT now()
         ) ENGINE = MergeTree
@@ -50,14 +46,12 @@ def ensure_base_tables(client: Client) -> None:
         """
     )
 
-
 def kline_table_name(symbol: str, market_type: str, period: str) -> str:
     # 命名遵循 service_bak_core.md：kline_{symbol}_{marketType}_{period}
     safe_symbol = symbol.lower().replace("-", "_").replace("/", "_")
     safe_market = market_type.lower()
     safe_period = period.lower()
     return f"kline_{safe_symbol}_{safe_market}_{safe_period}"
-
 
 def ensure_kline_table(client: Client, table_name: str) -> None:
     client.command(
@@ -81,3 +75,18 @@ def ensure_kline_table(client: Client, table_name: str) -> None:
         ORDER BY open_time
         """
     )
+
+def ensure_default_trading_pair(client: Client, symbol: str = "ethusdt", market_type: str = "um") -> None:
+    rs = client.query(
+        "SELECT count() FROM trading_pair_config WHERE symbol = %(s)s AND market_type = %(m)s",
+        params={"s": symbol, "m": market_type},
+    )
+    cnt = int(rs.result_rows[0][0]) if rs.result_rows else 0
+    if cnt == 0:
+        rs2 = client.query("SELECT coalesce(max(id), 0) FROM trading_pair_config")
+        max_id = int(rs2.result_rows[0][0]) if rs2.result_rows else 0
+        new_id = max_id + 1
+        client.command(
+            f"INSERT INTO trading_pair_config (id, symbol, market_type, enabled) "
+            f"VALUES ({new_id}, '{symbol}', '{market_type}', 1)"
+        )

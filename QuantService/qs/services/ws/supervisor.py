@@ -9,14 +9,16 @@ from ...gateways.binance_ws import ws_base_url
 from ...common.types import MarketType
 from .upstream import UpstreamStream
 from ...db.queries import get_enabled_pairs
+from .event_bus import EventBus
 
 class WebSocketSupervisor:
-    def __init__(self, cfg: AppConfig, ch_client: Client):
+    def __init__(self, cfg: AppConfig, ch_client: Client, event_bus: EventBus | None = None):
         self.cfg = cfg
         self.client = ch_client
         self.streams: Dict[str, UpstreamStream] = {}
         self.buffers: Dict[str, DataBuffer] = {}
         self.status: Dict[str, str] = {}
+        self.event_bus = event_bus
 
     async def start_stream(self, market: str, symbol: str, period: str):
         key = f"{market}|{symbol}|{period}".lower()
@@ -28,7 +30,7 @@ class WebSocketSupervisor:
         ensure_kline_table(self.client, table)
         buf = self.buffers.get(key)
         if not buf:
-            buf = DataBuffer(self.client, table, self.cfg.buffer.batch_size, self.cfg.buffer.flush_interval_ms)
+            buf = DataBuffer(self.client, table, self.cfg.buffer.batch_size, self.cfg.buffer.flush_interval_ms, event_bus=self.event_bus)
             self.buffers[key] = buf
             await buf.start()
         stream = UpstreamStream(

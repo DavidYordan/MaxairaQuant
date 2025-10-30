@@ -6,6 +6,7 @@ from db.schema import ensure_base_tables
 from services.backfill.manager import BackfillManager
 from services.ws.supervisor import WebSocketSupervisor
 from services.ws.client_server import ClientServer
+from services.ws.event_bus import EventBus
 from common.types import MarketType
 
 def main():
@@ -38,8 +39,9 @@ def main():
     ensure_base_tables(client)
 
     async def run():
+        bus = EventBus()
         if args.cmd == "clientserver":
-            srv = ClientServer(client, host=args.host, port=args.port, qps=args.qps)
+            srv = ClientServer(client, host=args.host, port=args.port, qps=args.qps, event_bus=bus)
             await srv.start()
             try:
                 while True:
@@ -47,12 +49,12 @@ def main():
             except KeyboardInterrupt:
                 await srv.stop()
         elif args.cmd == "backfill-gap":
-            mgr = BackfillManager(cfg, client)
+            mgr = BackfillManager(cfg, client, event_bus=bus)
             await mgr.start()
             await mgr.backfill_gap(MarketType(args.market), args.symbol, args.period, args.start_ms, args.end_ms)
             await mgr.stop()
         elif args.cmd == "ws-start":
-            sup = WebSocketSupervisor(cfg, client)
+            sup = WebSocketSupervisor(cfg, client, event_bus=bus)
             await sup.start_stream(args.market, args.symbol, args.period)
             try:
                 while True:

@@ -37,7 +37,7 @@ class IndicatorOnlineService:
                 cursor = self._cursors.get(table, 0)
                 if latest > cursor:
                     start_ms = max(0, cursor - preheat_ms)
-                    await self._insert_incremental(symbol, market, period, start_ms, latest)
+                    # 移除增量 INSERT，游标推进由物化视图负责指标写入
                     self._cursors[table] = latest
                 await asyncio.sleep(self.poll_interval_ms / 1000.0)
             except asyncio.CancelledError:

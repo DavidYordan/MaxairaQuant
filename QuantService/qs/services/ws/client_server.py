@@ -9,6 +9,8 @@ from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from loguru import logger
 from ...db.schema import kline_table_name
 from ...db.client import Client
+from ...common.types import Kline
+from .event_bus import EventBus
 
 class QueryLimiter:
     def __init__(self, qps: int):
@@ -73,7 +75,7 @@ class HotCache:
         return end_ms >= now_ms - self._window_ms
 
 class ClientServer:
-    def __init__(self, ch_client: Client, host: str = "0.0.0.0", port: int = 8765, qps: int = 20, hot_hours: int = 6, cache_ttl_s: float = 5.0, auth_required: bool = True, default_qps: int = 20, max_page_size: int = 2000, max_subscriptions: int = 2, min_poll_interval_ms: int = 500):
+    def __init__(self, ch_client: Client, host: str = "0.0.0.0", port: int = 8765, qps: int = 20, hot_hours: int = 6, cache_ttl_s: float = 5.0, auth_required: bool = True, default_qps: int = 20, max_page_size: int = 2000, max_subscriptions: int = 2, min_poll_interval_ms: int = 500, event_bus: Optional[EventBus] = None):
         self.client = ch_client
         self.host = host
         self.port = port
@@ -86,6 +88,7 @@ class ClientServer:
         self.max_page_size = max_page_size
         self.max_subscriptions = max_subscriptions
         self.min_poll_interval_ms = min_poll_interval_ms
+        self.event_bus = event_bus
 
     async def start(self):
         await self._limiter.start()
@@ -149,6 +152,18 @@ class ClientServer:
                             await self._handle_subscribe_incremental(ws, req, conn)
                         finally:
                             conn.subs_count -= 1
+                    elif action == "subscribe_push":
+                        if conn.subs_count >= self.max_subscriptions:
+                            await self._send(ws, {"error": "subscription_limit", "max": self.max_subscriptions}, compression)
+                            continue
+                        if self.event_bus is None:
+                            await self._send(ws, {"error": "push_unavailable"}, compression)
+                            continue
+                        conn.subs_count += 1
+                        try:
+                            await self._handle_subscribe_push(ws, req, conn)
+                        finally:
+                            conn.subs_count -= 1
                     else:
                         await self._send(ws, {"error": "unknown action"}, compression)
                 except Exception as e:
@@ -205,28 +220,46 @@ class ClientServer:
         market = req["market"]
         period = req["period"]
         cursor_ms = int(req.get("from_open_time_ms", 0))
-        page_size = int(req.get("page_size", 1000))
         compression = req.get("compression")
-        interval_ms = int(req.get("poll_interval_ms", 2000))
-        # 限制订阅轮询频率与每页大小
-        interval_ms = max(interval_ms, self.min_poll_interval_ms)
-        page_size = min(page_size, self.max_page_size)
         table = kline_table_name(symbol, market, period)
-
+        q = await self.event_bus.subscribe(table)
         try:
+            # 可选的一次性补齐（避免推送仅包含新写入）
+            rows = await self._fetch_page(table, cursor_ms, 2**63 - 1, min(1000, self.max_page_size))
+            if rows:
+                cursor_ms = rows[-1]["open_time"] + 1
+                await self._send(ws, {"ok": True, "rows": rows, "next_open_time_ms": cursor_ms}, compression)
+
             while True:
-                # 每次循环也遵守连接/全局限速
                 await self._limiter.acquire()
                 if conn_ctx and conn_ctx.limiter:
                     await conn_ctx.limiter.acquire()
-
-                rows = await self._fetch_page(table, cursor_ms, 2**63 - 1, page_size)
-                if rows:
-                    cursor_ms = rows[-1]["open_time"] + 1
-                    await self._send(ws, {"ok": True, "rows": rows, "next_open_time_ms": cursor_ms}, compression)
-                await asyncio.sleep(interval_ms / 1000.0)
+                batch: List[Kline] = await q.get()
+                # 过滤掉游标之前的数据
+                out: List[Dict[str, Any]] = []
+                for k in batch:
+                    if k.open_time_ms < cursor_ms:
+                        continue
+                    out.append({
+                        "open_time": int(k.open_time_ms),
+                        "close_time": int(k.close_time_ms),
+                        "open": str(k.open),
+                        "high": str(k.high),
+                        "low": str(k.low),
+                        "close": str(k.close),
+                        "volume": str(k.volume),
+                        "quote_volume": str(k.quote_volume),
+                        "count": int(k.count),
+                        "taker_buy_base_volume": str(k.taker_buy_base_volume),
+                        "taker_buy_quote_volume": str(k.taker_buy_quote_volume),
+                    })
+                if out:
+                    cursor_ms = out[-1]["open_time"] + 1
+                    await self._send(ws, {"ok": True, "rows": out, "next_open_time_ms": cursor_ms}, compression)
         except (ConnectionClosedOK, ConnectionClosedError):
             pass
+        finally:
+            self.event_bus.unsubscribe(table, q)
 
     async def _fetch_page(self, table: str, start_ms: int, end_ms: int, limit: int) -> List[Dict[str, Any]]:
         rs = await asyncio.to_thread(
