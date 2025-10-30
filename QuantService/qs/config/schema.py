@@ -9,7 +9,6 @@ class ClickHouseConfig(BaseModel):
     username: str
     password: str = ""
     timeout_ms: int = 10000
-    async_insert: bool = True
 
 
 class MarketConfig(BaseModel):
@@ -18,6 +17,7 @@ class MarketConfig(BaseModel):
 
 
 class BinanceConfig(BaseModel):
+    assets: list[str]
     spot: MarketConfig
     um: MarketConfig
     cm: MarketConfig
@@ -47,7 +47,7 @@ class BackfillConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
-    environment: str = "dev"
+    environment: str = "prod"
     clickhouse: ClickHouseConfig
     binance: BinanceConfig
     buffer: BufferConfig = Field(default_factory=BufferConfig)

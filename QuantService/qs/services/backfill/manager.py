@@ -9,7 +9,7 @@ from ...gateways.binance_rest import step_ms
 from ...services.backfill.rate_limiter import ApiRateLimiter
 from ...services.backfill.fetch import fetch_klines
 from ...services.proxy.registry import get_enabled_proxy_url
-from ...db.schema import ensure_kline_table, kline_table_name
+from ...db.schema import kline_table_name
 from ...monitoring.metrics import Metrics
 from ...services.ws.event_bus import EventBus
 
@@ -31,7 +31,7 @@ class BackfillManager:
         await self.limiter.stop()
 
     def _window_size_ms(self, period: str) -> int:
-        return step_ms(period) * self.cfg.binance.api_max_limit
+        return step_ms(period) * 1000  # 使用1000作为默认API限制
 
     def _split_gap(self, start_ms: int, end_ms: int, period: str) -> List[Tuple[int, int]]:
         size = self._window_size_ms(period)
@@ -55,7 +55,6 @@ class BackfillManager:
     async def backfill_gap(self, market: MarketType, symbol: str, period: str, gap_start_ms: int, gap_end_ms: int):
         logger.info("开始回填缺口：{} {} {} 范围={}~{}", market, symbol, period, gap_start_ms, gap_end_ms)
         table = kline_table_name(symbol, market.value, period)
-        ensure_kline_table(self.client, table)
         windows = self._split_gap(gap_start_ms, gap_end_ms, period)
         sem = asyncio.Semaphore(self._window_concurrency)
         tasks: List[asyncio.Task] = []
@@ -66,7 +65,16 @@ class BackfillManager:
     async def _ensure_buffer(self, table: str):
         buf = self._buffers.get(table)
         if not buf:
-            buf = DataBuffer(self.client, table, self.cfg.buffer.batch_size, self.cfg.buffer.flush_interval_ms, event_bus=self._event_bus)
+            # 创建缓冲区，使用优化的默认参数
+            buf = DataBuffer(
+                client=self.client, 
+                table=table, 
+                batch_size=3000,           # 回填使用更大批次
+                flush_interval_ms=2000,    # 2秒刷新间隔
+                event_bus=self._event_bus,
+                writer_workers=6,          # 回填使用更多写入器
+                max_queue_size=30000       # 更大队列应对批量数据
+            )
             self._buffers[table] = buf
             await buf.start()
         return buf
@@ -77,7 +85,7 @@ class BackfillManager:
             proxy_url = self._select_proxy_url(market)
             self.metrics.inc_requests()
             try:
-                klines, headers = await fetch_klines(self.cfg, market, symbol, period, ws, we, self.cfg.binance.api_max_limit, proxy_url)
+                klines, headers = await fetch_klines(self.cfg, market, symbol, period, ws, we, 1000, proxy_url)
                 self.limiter.update_from_headers(headers)
                 await self.limiter.maybe_block_by_minute_weight()
                 buf = await self._ensure_buffer(table)
@@ -101,6 +109,7 @@ class BackfillManager:
                     await asyncio.sleep(retry_after)
                     await self._retry_with_proxy(market, symbol, period, table, ws, we)
                 else:
+                    self.metrics.inc_failures()
                     logger.error("窗口失败：{} {} {} [{},{}] 状态={} 错误={}", market, symbol, period, ws, we, status, str(e))
             finally:
                 self.limiter.release()
@@ -109,7 +118,7 @@ class BackfillManager:
         await asyncio.sleep(0.5)
         proxy_url = self._select_proxy_url(market)
         try:
-            klines, headers = await fetch_klines(self.cfg, market, symbol, period, ws, we, self.cfg.binance.api_max_limit, proxy_url)
+            klines, headers = await fetch_klines(self.cfg, market, symbol, period, ws, we, 1000, proxy_url)
             self.limiter.update_from_headers(headers)
             await self.limiter.maybe_block_by_minute_weight()
             buf = await self._ensure_buffer(table)

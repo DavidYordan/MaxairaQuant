@@ -1,10 +1,10 @@
 from __future__ import annotations
 import asyncio
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from loguru import logger
 from ..config.schema import AppConfig
-from ..db.schema import kline_table_name, ensure_kline_table
+from ..db.schema import kline_table_name
 from ..db.queries import get_enabled_pairs, find_gaps_windowed_sql
 from ..services.backfill.manager import BackfillManager
 from ..gateways.binance_rest import step_ms
@@ -35,13 +35,12 @@ class GapHealScheduler:
         while True:
             try:
                 end_ms = int(time.time() * 1000)
-                start_ms = end_ms - self.cfg.backfill.window_minutes * s_ms
-                pairs = get_enabled_pairs(self.client)
+                start_ms = end_ms - 60 * s_ms  # 60分钟窗口
+                # 包裹同步调用，避免事件循环阻塞
+                pairs = await asyncio.to_thread(get_enabled_pairs, self.client)
                 for symbol, market in pairs:
-                    # 双周期：本循环固定 period
                     table = kline_table_name(symbol, market, period)
-                    ensure_kline_table(self.client, table)
-                    gaps = find_gaps_windowed_sql(self.client, table, start_ms, end_ms, s_ms)
+                    gaps = await asyncio.to_thread(find_gaps_windowed_sql, self.client, table, start_ms, end_ms, s_ms)
                     if gaps:
                         logger.info("发现缺口：{} {} {} 数量={}", market, symbol, period, len(gaps))
                     for (gs, ge) in gaps:

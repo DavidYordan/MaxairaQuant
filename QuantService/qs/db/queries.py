@@ -1,23 +1,25 @@
 from __future__ import annotations
+import asyncio
 from typing import List, Tuple
 from clickhouse_connect.driver.client import Client
 from ..common.types import Kline
 
 
-def get_enabled_pairs(client: Client) -> List[Tuple[str, str]]:
-    rs = client.query(
+async def get_enabled_pairs(client: Client) -> List[Tuple[str, str]]:
+    rs = await asyncio.to_thread(
+        client.query,
         "SELECT symbol, market_type FROM trading_pair_config WHERE enabled = 1 ORDER BY symbol, market_type"
     )
     return [(row[0], row[1]) for row in rs.result_rows]
 
 
-def get_max_open_time(client: Client, table_name: str) -> int:
-    rs = client.query(f"SELECT max(open_time) FROM {table_name}")
+async def get_max_open_time(client: Client, table_name: str) -> int:
+    rs = await asyncio.to_thread(client.query, f"SELECT max(open_time) FROM {table_name}")
     val = rs.first_row[0]
     return int(val or 0)
 
 
-def insert_klines(client: Client, table_name: str, klines: List[Kline]) -> None:
+async def insert_klines(client: Client, table_name: str, klines: List[Kline]) -> None:
     if not klines:
         return
     rows = [
@@ -36,7 +38,8 @@ def insert_klines(client: Client, table_name: str, klines: List[Kline]) -> None:
         ]
         for k in klines
     ]
-    client.insert(
+    await asyncio.to_thread(
+        client.insert,
         table_name,
         rows,
         column_names=[
@@ -104,3 +107,43 @@ def find_gaps_windowed_sql(
 
     gaps.sort(key=lambda g: g[0])
     return gaps
+
+def insert_indicator_ma_incremental(
+    client: Client,
+    source_table: str,
+    symbol: str,
+    market: str,
+    period: str,
+    start_ms: int,
+    end_ms: int,
+) -> None:
+    client.query(
+        f"""
+        INSERT INTO indicator_ma (symbol, market, period, open_time, ma20, ma50)
+        SELECT
+          %(symbol)s AS symbol,
+          %(market)s AS market,
+          %(period)s AS period,
+          open_time,
+          avg(toFloat64(close)) OVER (ORDER BY open_time ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
+          avg(toFloat64(close)) OVER (ORDER BY open_time ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS ma50
+        FROM {source_table}
+        WHERE open_time >= %(s)s AND open_time <= %(e)s
+        """,
+        query_parameters={
+            "symbol": symbol,
+            "market": market,
+            "period": period,
+            "s": start_ms,
+            "e": end_ms,
+        },
+    )
+
+def get_latest_enabled_proxy(client: Client) -> Tuple[str, int, str | None, str | None] | None:
+    rs = client.query(
+        "SELECT host, port, username, password FROM proxy_config WHERE enabled = 1 ORDER BY updated_at DESC LIMIT 1"
+    )
+    if not rs.result_rows:
+        return None
+    host, port, username, password = rs.result_rows[0]
+    return str(host), int(port), (username or None), (password or None)

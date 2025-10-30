@@ -30,9 +30,10 @@ class WindowReader:
     def __init__(self, client: Client):
         self.client = client
 
-    def read(self, symbol: str, market: str, period: str, start_ms: int, end_ms: int) -> List[Bar]:
+    async def read(self, symbol: str, market: str, period: str, start_ms: int, end_ms: int) -> List[Bar]:
         table = kline_table_name(symbol, market, period)
-        rs = self.client.query(
+        rs = await asyncio.to_thread(
+            self.client.query,
             f"""
             SELECT open_time, toFloat64(open), toFloat64(high), toFloat64(low), toFloat64(close), toFloat64(volume)
             FROM {table}
@@ -45,27 +46,6 @@ class WindowReader:
 class BacktestEngine:
     def __init__(self, client: Client):
         self.client = client
-        self._ensure_result_table()
-
-    def _ensure_result_table(self) -> None:
-        self.client.command(
-            """
-            CREATE TABLE IF NOT EXISTS backtest_results
-            (
-              job_id String,
-              symbol String,
-              market String,
-              period String,
-              params_json String,
-              metric_pnl Float64,
-              metric_sharpe Float64,
-              trades_json String,
-              started_at DateTime DEFAULT now(),
-              finished_at DateTime DEFAULT now()
-            ) ENGINE = MergeTree
-            ORDER BY (job_id, symbol, market, period)
-            """
-        )
 
     async def run(self, job_id: str, strategy: Strategy, symbol: str, market: str, period: str, start_ms: int, end_ms: int) -> None:
         reader = WindowReader(self.client)

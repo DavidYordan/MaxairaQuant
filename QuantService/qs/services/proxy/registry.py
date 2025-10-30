@@ -1,14 +1,13 @@
 from __future__ import annotations
 from clickhouse_connect.driver.client import Client
 from typing import Optional
+from ...db.queries import get_latest_enabled_proxy
 
 def get_enabled_proxy_url(client: Client) -> Optional[str]:
-    rs = client.query(
-        "SELECT host, port, username, password FROM proxy_config WHERE enabled = 1 ORDER BY updated_at DESC LIMIT 1"
-    )
-    if not rs.result_rows:
+    rec = get_latest_enabled_proxy(client)
+    if rec is None:
         return None
-    host, port, username, password = rs.result_rows[0]
+    host, port, username, password = rec
     auth = f"{username}:{password}" if username and password else ""
     scheme = "socks5"
     if auth:

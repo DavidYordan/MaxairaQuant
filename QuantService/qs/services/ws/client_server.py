@@ -160,10 +160,10 @@ class ClientServer:
                             await self._send(ws, {"error": "push_unavailable"}, compression)
                             continue
                         conn.subs_count += 1
-                        try:
-                            await self._handle_subscribe_push(ws, req, conn)
-                        finally:
-                            conn.subs_count -= 1
+                        # try:
+                        #     await self._handle_subscribe_push(ws, req, conn)
+                        # finally:
+                        #     conn.subs_count -= 1
                     else:
                         await self._send(ws, {"error": "unknown action"}, compression)
                 except Exception as e:
@@ -296,7 +296,8 @@ class ClientServer:
         try:
             rs = await asyncio.to_thread(
                 self.client.query,
-                f"SELECT enabled, qps_limit FROM api_keys WHERE api_key = {api_key} LIMIT 1"
+                "SELECT enabled, qps_limit FROM api_keys WHERE api_key = %(k)s LIMIT 1",
+                query_parameters={"k": api_key},
             )
             if not rs.result_rows:
                 return False, 0

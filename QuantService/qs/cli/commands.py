@@ -2,7 +2,6 @@ import argparse
 import asyncio
 from config.loader import load_config
 from db.client import get_client
-from db.schema import ensure_base_tables
 from services.backfill.manager import BackfillManager
 from services.ws.supervisor import WebSocketSupervisor
 from services.ws.client_server import ClientServer
@@ -27,7 +26,6 @@ def main():
     p_bf.add_argument("--start_ms", type=int, required=True)
     p_bf.add_argument("--end_ms", type=int, required=True)
 
-    # 临时启动一个 WS 上游流（演示/测试）
     p_ws = sub.add_parser("ws-start", help="Start a WS upstream (temporary)")
     p_ws.add_argument("--symbol", required=True)
     p_ws.add_argument("--market", choices=["spot", "um", "cm"], required=True)
@@ -36,7 +34,6 @@ def main():
     args = parser.parse_args()
     cfg = load_config("config/app.yaml")
     client = get_client(cfg.clickhouse)
-    ensure_base_tables(client)
 
     async def run():
         bus = EventBus()

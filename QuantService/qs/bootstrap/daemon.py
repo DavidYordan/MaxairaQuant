@@ -3,13 +3,12 @@ from pathlib import Path
 from loguru import logger
 from ..config.loader import load_config
 from ..db.client import get_client
-from ..db.schema import ensure_base_tables, ensure_kline_table, kline_table_name, ensure_default_trading_pair
+from ..db.schema import ensure_base_tables, ensure_bootstrap_defaults, ensure_indicator_tables, ensure_backtest_tables, ensure_indicator_views_for_pairs
 from ..db.queries import get_enabled_pairs
 from ..services.backfill.manager import BackfillManager
 from ..scheduler.gap_heal import GapHealScheduler
 from ..services.ws.supervisor import WebSocketSupervisor
 from ..services.ws.client_server import ClientServer
-from ..services.indicator.offline import IndicatorOfflineService
 from ..services.indicator.online import IndicatorOnlineService
 from ..services.ws.event_bus import EventBus
 
@@ -19,20 +18,16 @@ async def run_daemon(cfg_path: Path | str = None):
     cfg = load_config(cfg_path)
     client = get_client(cfg.clickhouse)
     ensure_base_tables(client)
-
-    # 插入默认交易对并预创建 K线表（1m/1h）
-    ensure_default_trading_pair(client, symbol="ethusdt", market_type="um")
-    for period in ["1m", "1h"]:
-        tbl = kline_table_name("ethusdt", "um", period)
-        ensure_kline_table(client, tbl)
-
-    # 2) 指标离线初始化
-    ind_off = IndicatorOfflineService(client)
-    ind_off.ensure_tables()
+    # 集中初始化：默认交易对与K线表
+    ensure_bootstrap_defaults(client, cfg.binance.assets)
+    # 新增：指标与回测表的集中初始化
+    ensure_indicator_tables(client)
+    ensure_backtest_tables(client)
+    # 初始化指标视图（根据启用的交易对与周期创建）
     pairs = get_enabled_pairs(client)
-    ind_off.bootstrap_materialized_views(pairs, ["1m", "1h"])
+    ensure_indicator_views_for_pairs(client, pairs, ["1m", "1h"])
 
-    # 3) 组装各服务
+    # 4) 组装各服务
     event_bus = EventBus()
     backfill = BackfillManager(cfg, client, event_bus=event_bus)
     scheduler = GapHealScheduler(cfg, client, backfill)
@@ -40,7 +35,7 @@ async def run_daemon(cfg_path: Path | str = None):
     ind_on = IndicatorOnlineService(client)
     client_srv = ClientServer(client, event_bus=event_bus)
 
-    # 4) 启动顺序
+    # 5) 启动顺序（所有 DB 初始化后再启动服务）
     await backfill.start()
     await scheduler.start()
     await ws_sup.start_enabled_streams()
@@ -48,7 +43,7 @@ async def run_daemon(cfg_path: Path | str = None):
     await client_srv.start()
     logger.info("守护已启动：回填/缺口调度/WS/指标在线/ClientServer")
 
-    # 5) 指标日志
+    # 6) 指标日志
     async def _metrics_loop():
         while True:
             snap = backfill.metrics.snapshot()
@@ -57,7 +52,7 @@ async def run_daemon(cfg_path: Path | str = None):
             await asyncio.sleep(60)
     asyncio.create_task(_metrics_loop())
 
-    # 6) 常驻
+    # 7) 常驻
     try:
         while True:
             await asyncio.sleep(5)
