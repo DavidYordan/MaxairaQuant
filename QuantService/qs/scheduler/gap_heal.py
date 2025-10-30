@@ -43,7 +43,7 @@ class GapHealScheduler:
                     ensure_kline_table(self.client, table)
                     gaps = find_gaps_windowed_sql(self.client, table, start_ms, end_ms, s_ms)
                     if gaps:
-                        logger.info("发现缺口：{} {} {} 数量={}, 范围={}~{}", market, symbol, period, len(gaps), gs, ge)
+                        logger.info("发现缺口：{} {} {} 数量={}", market, symbol, period, len(gaps))
                     for (gs, ge) in gaps:
                         key = f"{market}|{symbol}|{period}"
                         if self._running_keys.get(key, False):
