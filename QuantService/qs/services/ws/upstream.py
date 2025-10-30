@@ -108,8 +108,6 @@ class UpstreamStream:
             async with asyncio.timeout(30.0):  # 30秒连接超时
                 async with websockets.connect(
                     url,
-                    ping_interval=20,
-                    ping_timeout=20,
                     close_timeout=10,
                     max_queue=1024,
                 ) as ws:
@@ -125,24 +123,24 @@ class UpstreamStream:
         
         # 创建心跳监控任务
         heartbeat_task = asyncio.create_task(
-            self._heartbeat_monitor(),
+            self._heartbeat_monitor(ws),
             name=f"heartbeat_{self.symbol}_{self.period}"
         )
         
         try:
             while not self._stop:
                 try:
-                    # 等待消息，带超时
+                    # 等待消息，使用较长的超时时间
                     msg = await asyncio.wait_for(
                         ws.recv(), 
-                        timeout=self.heartbeat_timeout_ms / 1000.0
+                        timeout=60.0  # 增加到60秒，让心跳监控来处理超时
                     )
                     
                     self._last_msg_ts = time.time()
                     await self._handle_message(msg)
                     
                 except asyncio.TimeoutError:
-                    logger.warning(f"WS 心跳超时，准备重连：{self.symbol} {self.period}")
+                    logger.warning(f"WS 消息接收超时：{self.symbol} {self.period}")
                     break
                     
                 except websockets.exceptions.ConnectionClosed as e:
@@ -157,23 +155,54 @@ class UpstreamStream:
             except asyncio.CancelledError:
                 pass
 
-    async def _heartbeat_monitor(self):
-        """心跳监控任务"""
+    async def _heartbeat_monitor(self, ws):
+        """心跳监控任务 - 改进的连接健康检查"""
+        consecutive_silent_periods = 0
+        max_silent_periods = 3  # 允许3个连续的静默周期
+        
         while not self._stop:
             try:
-                await asyncio.sleep(10.0)  # 每10秒检查一次
+                await asyncio.sleep(20.0)  # 每20秒检查一次
                 
                 current_time = time.time()
                 time_since_last_msg = current_time - self._last_msg_ts
                 
+                # 如果超过心跳超时时间没有收到消息
                 if time_since_last_msg > (self.heartbeat_timeout_ms / 1000.0):
+                    consecutive_silent_periods += 1
                     logger.warning(
-                        f"WS心跳检测失败: {self.symbol} {self.period} "
-                        f"距离上次消息 {time_since_last_msg:.1f}s"
+                        f"WS心跳检测: {self.symbol} {self.period} "
+                        f"距离上次消息 {time_since_last_msg:.1f}s "
+                        f"(连续静默周期: {consecutive_silent_periods}/{max_silent_periods})"
                     )
-                    break
+                    
+                    # 发送ping来测试连接
+                    try:
+                        pong_waiter = await ws.ping()
+                        await asyncio.wait_for(pong_waiter, timeout=10.0)
+                        logger.info(f"WS ping/pong 成功: {self.symbol} {self.period}")
+                        consecutive_silent_periods = 0  # 重置计数器
+                        continue
+                    except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+                        logger.error(f"WS ping/pong 失败: {self.symbol} {self.period}")
+                        
+                    # 如果连续多个周期都没有消息且ping失败，则断开连接
+                    if consecutive_silent_periods >= max_silent_periods:
+                        logger.error(
+                            f"WS连接健康检查失败: {self.symbol} {self.period} "
+                            f"连续 {consecutive_silent_periods} 个周期无响应"
+                        )
+                        break
+                else:
+                    # 重置静默周期计数器
+                    if consecutive_silent_periods > 0:
+                        logger.info(f"WS连接恢复正常: {self.symbol} {self.period}")
+                        consecutive_silent_periods = 0
                     
             except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"心跳监控异常: {self.symbol} {self.period} 错误={e}")
                 break
 
     async def _handle_message(self, msg: str | bytes):

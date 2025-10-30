@@ -20,6 +20,7 @@ class BackfillManager:
         self.client = ch_client
         self.limiter = ApiRateLimiter(cfg.binance.requests_per_second)
         self._markets_using_proxy: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
+        self._markets_tested: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
         self._window_concurrency = cfg.backfill.concurrency_windows
         self.metrics = Metrics()
         self._buffers: Dict[str, DataBuffer] = {}
@@ -61,6 +62,9 @@ class BackfillManager:
     async def backfill_gap(self, market: MarketType, symbol: str, period: str, gap_start_ms: int, gap_end_ms: int):
         """回填数据缺口 - 改进的并发控制和错误处理"""
         logger.info(f"开始回填缺口：{market} {symbol} {period} 范围={gap_start_ms}~{gap_end_ms}")
+        
+        # 首先进行连接探测
+        await self._test_market_connection(market, symbol, period)
         
         table = kline_table_name(symbol, market.value, period)
         windows = self._split_gap(gap_start_ms, gap_end_ms, period)
@@ -197,6 +201,62 @@ class BackfillManager:
         """为指定市场启用代理"""
         self._markets_using_proxy[market] = True
         logger.warning(f"启用代理用于市场：{market}")
+
+    async def _test_market_connection(self, market: MarketType, symbol: str, period: str):
+        """测试市场连接状态，决定是否需要使用代理"""
+        if hasattr(self, '_markets_tested') and self._markets_tested.get(market, False):
+            logger.debug(f"市场 {market} 已测试过连接状态")
+            return
+            
+        if not hasattr(self, '_markets_tested'):
+            self._markets_tested = {}
+            
+        logger.info(f"正在测试市场连接：{market}")
+        
+        # 使用一个小的时间窗口进行测试
+        import time
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - step_ms(period) * 5  # 测试5个周期的数据
+        
+        try:
+            # 先尝试不使用代理
+            await self.limiter.acquire()
+            try:
+                klines, headers = await fetch_klines(
+                    self.cfg, market, symbol, period, start_ms, end_ms, 5, None
+                )
+                self.limiter.update_from_headers(headers)
+                logger.info(f"市场 {market} 连接正常，无需代理")
+                self._markets_tested[market] = True
+                return
+                
+            except Exception as e:
+                response = getattr(e, "response", None)
+                status = response.status_code if response is not None else None
+                
+                if status in (403, 451):  # 地理限制
+                    logger.warning(f"市场 {market} 遇到地理限制 (状态码: {status})，启用代理模式")
+                    self.enable_proxy_for_market(market)
+                    
+                    # 测试代理连接
+                    proxy_url = await self._select_proxy_url(market)
+                    if proxy_url:
+                        klines, headers = await fetch_klines(
+                            self.cfg, market, symbol, period, start_ms, end_ms, 5, proxy_url
+                        )
+                        self.limiter.update_from_headers(headers)
+                        logger.info(f"市场 {market} 代理连接测试成功")
+                    else:
+                        logger.error(f"市场 {market} 无可用代理")
+                        raise Exception(f"市场 {market} 无法连接且无可用代理")
+                else:
+                    logger.error(f"市场 {market} 连接测试失败，状态码: {status}")
+                    raise
+                    
+        finally:
+            self.limiter.release()
+            
+        self._markets_tested[market] = True
 
     async def _ensure_buffer(self, table: str):
         """确保数据缓冲区存在并已启动"""

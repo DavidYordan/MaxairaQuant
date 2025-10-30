@@ -43,7 +43,7 @@ class WebSocketConfig(BaseModel):
 class BackfillConfig(BaseModel):
     concurrency_windows: int = 4
     window_minutes: int = 60
-    start_date: str = "2020-01-01"
+    start_date: str
 
 
 class AppConfig(BaseModel):
