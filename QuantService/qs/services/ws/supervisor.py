@@ -67,7 +67,7 @@ class WebSocketSupervisor:
         logger.info("WS 流已停止：{}", key)
 
     async def start_enabled_streams(self):
-        pairs = get_enabled_pairs(self.client)
+        pairs = await get_enabled_pairs(self.client)
         for symbol, market in pairs:
             await self.start_stream(market, symbol, "1m")
             await self.start_stream(market, symbol, "1h")
