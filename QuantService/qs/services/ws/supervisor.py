@@ -32,7 +32,7 @@ class WebSocketSupervisor:
             # 创建缓冲区，使用优化的默认参数
             buf = DataBuffer(
                 client=self.client, 
-                table=table, 
+                table_name=table, 
                 batch_size=2000,           # 优化的批次大小
                 flush_interval_ms=1500,    # 1.5秒刷新间隔
                 event_bus=self.event_bus,
@@ -42,7 +42,7 @@ class WebSocketSupervisor:
             self.buffers[key] = buf
             await buf.start()
         stream = UpstreamStream(
-            base_ws_url=ws_url,
+            base_ws_url=base,
             symbol=symbol,
             period=period,
             buffer=buf,

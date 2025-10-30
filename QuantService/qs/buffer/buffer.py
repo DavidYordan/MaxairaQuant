@@ -21,6 +21,7 @@ class DataBuffer:
         self._buf: List[Kline] = []
         self._lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
+        self._stopped = False  # 添加停止标志
         
         # 高性能写入队列配置
         self._write_q: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
@@ -169,7 +170,7 @@ class DataBuffer:
 
     async def _flush_loop(self):
         """定时刷新循环"""
-        while True:
+        while not self._stopped:
             try:
                 await asyncio.sleep(self.flush_interval_ms / 1000.0)
                 await self.flush()
@@ -177,19 +178,6 @@ class DataBuffer:
                 break
             except Exception as e:
                 self.logger.error(f"Flush loop error: {e}")
-
-    async def _writer_loop(self, worker_id: int):
-        """写入工作器循环"""
-        self.logger.info(f"Writer worker {worker_id} started")
-        while True:
-            try:
-                batch = await self._write_q.get()
-                await self._write_with_retry(batch, worker_id)
-                self._write_q.task_done()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"Writer worker {worker_id} error: {e}")
 
     async def _write_with_retry(self, batch: List[Kline], worker_id: int, max_retries: int = 5):
         """带重试的写入逻辑，增强错误处理和性能优化"""

@@ -205,7 +205,7 @@ class BackfillManager:
             # 创建缓冲区，使用优化的默认参数
             buf = DataBuffer(
                 client=self.client, 
-                table=table, 
+                table_name=table, 
                 batch_size=3000,           # 回填使用更大批次
                 flush_interval_ms=2000,    # 2秒刷新间隔
                 event_bus=self._event_bus,
