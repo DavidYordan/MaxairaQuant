@@ -273,7 +273,7 @@ class ClientServer:
             ORDER BY open_time
             LIMIT %(l)s
             """,
-            params={"s": start_ms, "e": end_ms, "l": limit},
+            query_parameters={"s": start_ms, "e": end_ms, "l": limit},
         )
         rows: List[Dict[str, Any]] = []
         for r in rs.result_rows:
@@ -296,8 +296,7 @@ class ClientServer:
         try:
             rs = await asyncio.to_thread(
                 self.client.query,
-                "SELECT enabled, qps_limit FROM api_keys WHERE api_key = %(k)s LIMIT 1",
-                params={"k": api_key},
+                f"SELECT enabled, qps_limit FROM api_keys WHERE api_key = {api_key} LIMIT 1"
             )
             if not rs.result_rows:
                 return False, 0

@@ -49,7 +49,7 @@ class IndicatorOfflineService:
 
     def compute_batch(self, symbol: str, market: str, period: str, start_ms: int, end_ms: int) -> None:
         table = kline_table_name(symbol, market, period)
-        self.client.command(
+        self.client.query(
             f"""
             INSERT INTO indicator_ma (symbol, market, period, open_time, ma20, ma50)
             SELECT
@@ -62,5 +62,5 @@ class IndicatorOfflineService:
             FROM {table}
             WHERE open_time >= %(s)s AND open_time <= %(e)s
             """,
-            params={"s": start_ms, "e": end_ms},
+            query_parameters={"s": start_ms, "e": end_ms},
         )

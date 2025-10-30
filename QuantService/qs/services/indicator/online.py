@@ -48,7 +48,7 @@ class IndicatorOnlineService:
     async def _insert_incremental(self, symbol: str, market: str, period: str, start_ms: int, end_ms: int) -> None:
         table = kline_table_name(symbol, market, period)
         await asyncio.to_thread(
-            self.client.command,
+            self.client.query,
             f"""
             INSERT INTO indicator_ma (symbol, market, period, open_time, ma20, ma50)
             SELECT
@@ -61,5 +61,5 @@ class IndicatorOnlineService:
             FROM {table}
             WHERE open_time >= %(s)s AND open_time <= %(e)s
             """,
-            params={"s": start_ms, "e": end_ms},
+            query_parameters={"s": start_ms, "e": end_ms},
         )

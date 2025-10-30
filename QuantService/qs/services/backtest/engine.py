@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Dict, Any, List
@@ -35,10 +36,9 @@ class WindowReader:
             f"""
             SELECT open_time, toFloat64(open), toFloat64(high), toFloat64(low), toFloat64(close), toFloat64(volume)
             FROM {table}
-            WHERE open_time >= %(s)s AND open_time <= %(e)s
+            WHERE open_time >= {start_ms} AND open_time <= {end_ms}
             ORDER BY open_time
-            """,
-            params={"s": start_ms, "e": end_ms},
+            """
         )
         return [Bar(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in rs.result_rows]
 
@@ -73,12 +73,12 @@ class BacktestEngine:
         signals = strategy.on_bars(bars)
         metrics = strategy.finalize()
         await asyncio.to_thread(
-            self.client.command,
+            self.client.query,
             """
             INSERT INTO backtest_results (job_id, symbol, market, period, params_json, metric_pnl, metric_sharpe, trades_json)
             VALUES (%(job_id)s, %(symbol)s, %(market)s, %(period)s, %(params)s, %(pnl)s, %(sharpe)s, %(trades)s)
             """,
-            params={
+            query_parameters={
                 "job_id": job_id,
                 "symbol": symbol,
                 "market": market,

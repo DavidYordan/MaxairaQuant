@@ -64,8 +64,7 @@ def find_gaps_windowed_sql(
 ) -> List[Tuple[int, int]]:
     # 统计、边界
     agg = client.query(
-        f"SELECT count() AS c, min(open_time) AS min_ot, max(open_time) AS max_ot FROM {table_name} WHERE open_time >= %(s)s AND open_time <= %(e)s",
-        params={"s": window_start_ms, "e": window_end_ms},
+        f"SELECT count() AS c, min(open_time) AS min_ot, max(open_time) AS max_ot FROM {table_name} WHERE open_time >= {window_start_ms} AND open_time <= {window_end_ms}"
     ).first_row
     count = int(agg[0] or 0)
     if count == 0:
@@ -80,11 +79,11 @@ def find_gaps_windowed_sql(
           open_time,
           lag(open_time, 1) OVER (ORDER BY open_time) AS prev_ot
         FROM {table_name}
-        WHERE open_time >= %(s)s AND open_time <= %(e)s
+        WHERE open_time >= {window_start_ms} AND open_time <= {window_end_ms}
         ORDER BY open_time
-        """,
-        params={"s": window_start_ms, "e": window_end_ms},
+        """
     )
+
     gaps: List[Tuple[int, int]] = []
     for row in rs.result_rows:
         ot = int(row[0])
