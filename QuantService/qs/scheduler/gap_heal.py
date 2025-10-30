@@ -5,62 +5,68 @@ from typing import Dict, List
 from loguru import logger
 from ..config.schema import AppConfig
 from ..db.schema import kline_table_name
-from ..db.queries import get_enabled_pairs, find_gaps_windowed_sql
+from ..db.queries import get_enabled_pairs, find_gaps_windowed_sql, get_max_open_time
 from ..services.backfill.manager import BackfillManager
 from ..gateways.binance_rest import step_ms
 from ..common.types import MarketType
 from ..db.client import AsyncClickHouseClient
 
+
 class GapHealScheduler:
-    """数据缺口修复调度器 - 改进的异步任务管理"""
-    
+    """
+    水位驱动的缺口修复调度器
+
+    - 不做历史全量初扫，不维护初扫状态
+    - 每轮按周期对每个交易对计算水位（max(open_time)），在水位附近做小范围回看（lookback）
+      并扫描到最新闭合K线
+    - 仅对真实缺口派发回填任务，避免重复写入
+    """
+
     def __init__(self, cfg: AppConfig, ch_client: AsyncClickHouseClient, backfill: BackfillManager):
         self.cfg = cfg
         self.client = ch_client
         self.backfill = backfill
+
         self._tasks: List[asyncio.Task] = []
-        self._running_keys: Dict[str, bool] = {}
         self._shutdown_event = asyncio.Event()
-        self._task_semaphore = asyncio.Semaphore(10)  # 限制并发任务数
-        self._initial_scan_done: Dict[str, bool] = {}  # 跟踪是否已完成初始扫描
+
+        # 并发控制
+        self._scan_pair_concurrency = 4                 # 并发扫描交易对数量
+        self._task_semaphore = asyncio.Semaphore(8)     # 回填任务最大并发数
+
+        # 去重控制：以“缺口范围”为维度标记
+        self._running_keys: Dict[str, bool] = {}
+
+        # 回看步数：容忍迟到写入与小范围波动（可按需调整）
+        self._lookback_steps = 5
 
     async def start(self):
-        """启动调度器"""
         if self._tasks:
-            logger.warning("GapHealScheduler 已经在运行")
+            logger.warning("GapHealScheduler 已在运行")
             return
-            
+
         self._shutdown_event.clear()
-        
-        # 创建调度任务
         tasks_config = [
-            ("1m", 30),   # 1分钟周期，每30秒扫描
-            ("1h", 300),  # 1小时周期，每5分钟扫描
+            ("1m", 30),   # 每30秒扫一次1m
+            ("1h", 300),  # 每5分钟扫一次1h
         ]
-        
         for period, interval_s in tasks_config:
-            task = asyncio.create_task(
-                self._loop_with_error_handling(period, interval_s),
-                name=f"gap_heal_{period}"
-            )
+            task = asyncio.create_task(self._loop(period, interval_s), name=f"gap_heal_{period}")
             self._tasks.append(task)
-            
-        logger.info("GapHealScheduler 已启动（1m/30s，1h/300s）")
+
+        logger.info("GapHealScheduler 启动完成（1m/30s，1h/300s）")
 
     async def stop(self):
-        """优雅停止调度器"""
         if not self._tasks:
             return
-            
+
         logger.info("正在停止 GapHealScheduler...")
         self._shutdown_event.set()
-        
-        # 取消所有任务
+
         for task in self._tasks:
             if not task.done():
                 task.cancel()
-        
-        # 等待任务完成或超时
+
         if self._tasks:
             try:
                 await asyncio.wait_for(
@@ -69,81 +75,66 @@ class GapHealScheduler:
                 )
             except asyncio.TimeoutError:
                 logger.warning("部分任务未能在超时时间内完成")
-        
+
         self._tasks.clear()
         self._running_keys.clear()
         logger.info("GapHealScheduler 已停止")
 
-    async def _loop_with_error_handling(self, period: str, interval_s: int):
-        """带错误处理的循环任务"""
+    async def _loop(self, period: str, interval_s: int):
         consecutive_errors = 0
         max_consecutive_errors = 5
-        
+
         while not self._shutdown_event.is_set():
             try:
-                await self._scan_and_heal(period, interval_s)
-                consecutive_errors = 0  # 重置错误计数
-                
+                await self._scan_period(period)
+                consecutive_errors = 0
             except asyncio.CancelledError:
                 logger.info(f"Gap heal loop {period} 被取消")
                 break
-                
             except Exception as e:
                 consecutive_errors += 1
-                logger.error(f"GapHealScheduler {period} 异常 (连续第{consecutive_errors}次): {e}")
-                
+                logger.exception(f"GapHealScheduler[{period}] 异常(第{consecutive_errors}次): {e}")
                 if consecutive_errors >= max_consecutive_errors:
-                    logger.error(f"GapHealScheduler {period} 连续错误过多，停止运行")
+                    logger.error(f"GapHealScheduler[{period}] 连续错误过多，停止该周期")
                     break
-                    
-                # 指数退避
-                error_sleep = min(interval_s * (2 ** (consecutive_errors - 1)), 300)
-                await asyncio.sleep(error_sleep)
-                continue
-            
-            # 正常间隔等待
-            try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(), 
-                    timeout=interval_s
-                )
-                break  # 收到停止信号
-            except asyncio.TimeoutError:
-                continue  # 超时继续下一轮
+                await asyncio.sleep(min(interval_s * (2 ** (consecutive_errors - 1)), 300))
 
-    async def _scan_and_heal(self, period: str, interval_s: int):
-        """扫描并修复缺口 - 支持初始全量扫描和增量扫描"""
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval_s)
+                break
+            except asyncio.TimeoutError:
+                continue
+
+    async def _scan_period(self, period: str):
         s_ms = step_ms(period)
-        end_ms = int(time.time() * 1000)
-        
-        # 获取启用的交易对 - 添加重试机制
+
+        # 将结束时间对齐到“最后一根已闭合K线”的开盘时间，避免尾部伪缺口
+        now_ms = int(time.time() * 1000)
+        end_ms = (now_ms // s_ms) * s_ms - s_ms
+        if end_ms <= 0:
+            return
+
+        # 获取启用交易对（带重试）
         pairs = await self._get_enabled_pairs_with_retry()
-        
-        # 限制并发数量，避免过多的数据库连接
-        max_concurrent = min(len(pairs), 3)  # 最多3个并发
-        semaphore = asyncio.Semaphore(max_concurrent)
-        
-        # 并发处理所有交易对
-        scan_tasks = []
+
+        # 限制并发扫描，避免对 CH 产生过多并发查询
+        sem = asyncio.Semaphore(min(self._scan_pair_concurrency, max(1, len(pairs))))
+        tasks: List[asyncio.Task] = []
         for symbol, market in pairs:
             task = asyncio.create_task(
-                self._scan_pair_with_semaphore(semaphore, symbol, market, period, end_ms, s_ms),
+                self._scan_pair(sem, symbol, market, period, s_ms, end_ms),
                 name=f"scan_{market}_{symbol}_{period}"
             )
-            scan_tasks.append(task)
-        
-        if scan_tasks:
-            # 使用gather收集结果，忽略异常
-            results = await asyncio.gather(*scan_tasks, return_exceptions=True)
-            
-            # 记录异常
+            tasks.append(task)
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     symbol, market = pairs[i]
                     logger.error(f"扫描交易对失败 {market} {symbol} {period}: {result}")
 
     async def _get_enabled_pairs_with_retry(self, max_retries: int = 3):
-        """获取启用的交易对，带重试机制"""
         for attempt in range(max_retries):
             try:
                 return await get_enabled_pairs(self.client)
@@ -151,113 +142,68 @@ class GapHealScheduler:
                 if attempt == max_retries - 1:
                     logger.error(f"获取交易对失败，已重试{max_retries}次: {e}")
                     raise
-                else:
-                    logger.warning(f"获取交易对失败，第{attempt + 1}次重试: {e}")
-                    await asyncio.sleep(1.0 * (attempt + 1))  # 递增延迟
+                logger.warning(f"获取交易对失败，第{attempt + 1}次重试: {e}")
+                await asyncio.sleep(1.0 * (attempt + 1))
 
-    async def _scan_pair_with_semaphore(self, semaphore: asyncio.Semaphore, 
-                                      symbol: str, market: str, period: str, 
-                                      end_ms: int, s_ms: int):
-        """使用信号量控制的交易对扫描"""
-        async with semaphore:
-            await self._scan_pair_with_strategy(symbol, market, period, end_ms, s_ms)
+    async def _scan_pair(self, sem: asyncio.Semaphore, symbol: str, market: str, period: str, s_ms: int, end_ms: int):
+        async with sem:
+            table = kline_table_name(symbol, market, period)
 
-    async def _scan_pair_with_strategy(self, symbol: str, market: str, period: str, 
-                                     end_ms: int, s_ms: int):
-        """根据策略扫描交易对缺口"""
-        pair_key = f"{market}_{symbol}_{period}"
-        
-        # 检查是否需要进行初始全量扫描
-        if not self._initial_scan_done.get(pair_key, False):
-            await self._initial_full_scan(symbol, market, period, end_ms, s_ms)
-            self._initial_scan_done[pair_key] = True
-        else:
-            # 增量扫描最近的数据
-            await self._incremental_scan(symbol, market, period, end_ms, s_ms)
+            # 读取水位：当前表内最大 open_time
+            try:
+                last_ot = await get_max_open_time(self.client, table)
+            except Exception as e:
+                logger.error(f"读取水位失败 {market} {symbol} {period}: {e}")
+                return
 
-    async def _initial_full_scan(self, symbol: str, market: str, period: str, 
-                               end_ms: int, s_ms: int):
-        """初始全量扫描 - 检测大范围历史数据缺口"""
-        table = kline_table_name(symbol, market, period)
-        
-        # 获取表中的数据范围
-        try:
-            rs = await self.client.query(
-                f"SELECT min(open_time) as min_time, max(open_time) as max_time, count() as cnt FROM {table}"
-            )
-            
-            if not rs.result_rows or rs.result_rows[0][2] == 0:
-                # 表为空，需要从历史开始回填
-                logger.info(f"表 {table} 为空，开始全量历史数据回填")
-                
-                # 从配置文件获取历史开始时间
-                start_ms = int(time.mktime(time.strptime(self.cfg.binance.historical_start_dates, "%Y-%m-%d")) * 1000)
-                    
-                # 检测整个历史范围的缺口
-                gaps = await find_gaps_windowed_sql(self.client, table, start_ms, end_ms, s_ms)
-                
+            # 计算扫描起点：从水位回看少量步数，容忍迟到写入
+            if last_ot and last_ot > 0:
+                start_ms = max(last_ot - self._lookback_steps * s_ms, 0)
             else:
-                min_time = int(rs.result_rows[0][0] or end_ms)
-                max_time = int(rs.result_rows[0][1] or end_ms)
-                
-                logger.info(f"表 {table} 数据范围: {min_time} ~ {max_time}")
-                
-                # 检测从历史开始到现在的所有缺口
-                historical_start = int(time.mktime(time.strptime(self.cfg.binance.historical_start_dates, "%Y-%m-%d")) * 1000)
-                
-                gaps = await find_gaps_windowed_sql(self.client, table, historical_start, end_ms, s_ms)
-                
-        except Exception as e:
-            logger.error(f"初始扫描失败 {table}: {e}")
-            return
-            
-        if gaps:
-            logger.info(f"初始扫描发现大缺口：{market} {symbol} {period} 数量={len(gaps)}")
-            await self._process_gaps(symbol, market, period, gaps)
-        else:
-            logger.info(f"初始扫描完成，无缺口：{market} {symbol} {period}")
+                # 表为空：从配置中的历史起点开始
+                try:
+                    start_ms = int(time.mktime(time.strptime(self.cfg.binance.historical_start_dates, "%Y-%m-%d")) * 1000)
+                except Exception:
+                    # 配置异常时，退化为回看 7 天
+                    start_ms = end_ms - 7 * 24 * 60 * 60 * 1000
 
-    async def _incremental_scan(self, symbol: str, market: str, period: str, 
-                              end_ms: int, s_ms: int):
-        """增量扫描最近的数据"""
-        start_ms = end_ms - 60 * s_ms  # 检查最近60个周期
-        
-        table = kline_table_name(symbol, market, period)
-        gaps = await find_gaps_windowed_sql(self.client, table, start_ms, end_ms, s_ms)
-        
-        if gaps:
-            logger.info(f"增量扫描发现缺口：{market} {symbol} {period} 数量={len(gaps)}")
-            await self._process_gaps(symbol, market, period, gaps)
+            start_ms = min(start_ms, end_ms)
+            if start_ms >= end_ms:
+                return
 
-    async def _process_gaps(self, symbol: str, market: str, period: str, gaps: List):
-        """处理发现的缺口"""
-        for (gs, ge) in gaps:
-            key = f"{market}|{symbol}|{period}"
-            
-            # 检查是否已在运行
-            if self._running_keys.get(key, False):
-                continue
-                
-            # 使用信号量限制并发
-            async with self._task_semaphore:
+            # 查找缺口
+            try:
+                gaps = await find_gaps_windowed_sql(self.client, table, start_ms, end_ms, s_ms)
+            except Exception as e:
+                logger.error(f"缺口查询失败 {market} {symbol} {period}: {e}")
+                return
+
+            if not gaps:
+                logger.debug(f"无缺口：{market} {symbol} {period} 范围={start_ms}~{end_ms}")
+                return
+
+            # 按缺口维度派发回填任务（包含范围去重）
+            for gs, ge in gaps:
+                key = f"{market}|{symbol}|{period}|{gs}|{ge}"
+                if self._running_keys.get(key, False):
+                    continue
+
                 self._running_keys[key] = True
-                logger.info(f"开始填充缺口：{market} {symbol} {period} 范围={gs}~{ge}")
-                
-                # 创建独立的修复任务
                 asyncio.create_task(
                     self._dispatch_and_release(key, market, symbol, period, gs, ge),
-                    name=f"heal_{key}_{gs}_{ge}"
+                    name=f"heal_{market}_{symbol}_{period}_{gs}_{ge}"
                 )
 
-    async def _dispatch_and_release(self, key: str, market: str, symbol: str, 
-                                  period: str, gs: int, ge: int):
-        """分发修复任务并释放锁"""
+    async def _dispatch_and_release(self, key: str, market: str, symbol: str, period: str, gs: int, ge: int):
         try:
-            await self.backfill.backfill_gap(
-                MarketType(market), symbol, period, gs, ge
-            )
-            logger.info(f"缺口修复完成：{key} 范围={gs}~{ge}")
+            # 将并发限制用于实际执行阶段，避免任务泛滥
+            async with self._task_semaphore:
+                logger.info(f"开始回填缺口：{market} {symbol} {period} [{gs},{ge}]")
+                await self.backfill.backfill_gap(
+                    MarketType(market), symbol, period, gs, ge
+                )
+                logger.info(f"回填完成：{market} {symbol} {period} [{gs},{ge}]")
         except Exception as e:
-            logger.error(f"缺口修复失败：{key} 范围={gs}~{ge} 错误={e}")
+            logger.error(f"回填失败：{market} {symbol} {period} [{gs},{ge}] 错误={e}")
         finally:
-            self._running_keys[key] = False
+            self._running_keys.pop(key, None)
