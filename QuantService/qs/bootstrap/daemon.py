@@ -93,12 +93,10 @@ async def run_daemon(cfg_path: Path | str = None):
 
             logger.info(
                 "Metrics: req={} ok={} fail={} rows={} | loop_delay(avg_ms={:.1f}, max_ms={:.1f}) | "
-                "BackfillQ(total={}, max={}, workers={}) | WSQ(total={}, max={}, workers={}) | "
-                "EventBus(topics={}, subs={}, queues={}, delivered={}, dropped={})",
+                "BackfillQ(total={}, max={}, workers={}) | EventBus(topics={}, subs={}, queues={}, delivered={}, dropped={})",
                 snap.requests, snap.successes, snap.failures, snap.inserted_rows,
                 avg_ms, max_ms,
                 bf_total_q, bf_max_q, bf_workers,
-                ws_total_q, ws_max_q, ws_workers,
                 eb_topics, eb_subs, eb_queues, eb_delivered, eb_dropped
             )
             await asyncio.sleep(60)
