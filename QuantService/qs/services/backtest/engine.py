@@ -58,7 +58,7 @@ class BacktestEngine:
             INSERT INTO backtest_results (job_id, symbol, market, period, params_json, metric_pnl, metric_sharpe, trades_json)
             VALUES (%(job_id)s, %(symbol)s, %(market)s, %(period)s, %(params)s, %(pnl)s, %(sharpe)s, %(trades)s)
             """,
-            query_parameters={
+            parameters={
                 "job_id": job_id,
                 "symbol": symbol,
                 "market": market,

@@ -78,7 +78,7 @@ def ensure_kline_table(client: Client, table_name: str) -> None:
 def ensure_trading_pair_entry(client: Client, symbol: str, market_type: str, enabled: int) -> None:
     rs = client.query(
         "SELECT count() FROM trading_pair_config WHERE symbol = %(s)s AND market_type = %(m)s",
-        query_parameters={"s": symbol, "m": market_type},
+        parameters={"s": symbol, "m": market_type},
     )
     cnt = int(rs.result_rows[0][0]) if rs.result_rows else 0
     if cnt == 0:

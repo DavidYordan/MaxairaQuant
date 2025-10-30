@@ -130,7 +130,7 @@ def insert_indicator_ma_incremental(
         FROM {source_table}
         WHERE open_time >= %(s)s AND open_time <= %(e)s
         """,
-        query_parameters={
+        parameters={
             "symbol": symbol,
             "market": market,
             "period": period,
