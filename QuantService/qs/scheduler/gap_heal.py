@@ -160,7 +160,7 @@ class GapHealScheduler:
                 logger.info(f"表 {table} 为空，开始全量历史数据回填")
                 
                 # 从配置文件获取历史开始时间
-                start_ms = int(time.mktime(time.strptime(self.cfg.backfill.historical_start_dates, "%Y-%m-%d")) * 1000)
+                start_ms = int(time.mktime(time.strptime(self.cfg.binance.historical_start_dates, "%Y-%m-%d")) * 1000)
                     
                 # 检测整个历史范围的缺口
                 gaps = await find_gaps_windowed_sql(self.client, table, start_ms, end_ms, s_ms)
@@ -172,7 +172,7 @@ class GapHealScheduler:
                 logger.info(f"表 {table} 数据范围: {min_time} ~ {max_time}")
                 
                 # 检测从历史开始到现在的所有缺口
-                historical_start = int(time.mktime(time.strptime(self.cfg.backfill.historical_start_dates, "%Y-%m-%d")) * 1000)
+                historical_start = int(time.mktime(time.strptime(self.cfg.binance.historical_start_dates, "%Y-%m-%d")) * 1000)
                 
                 gaps = await find_gaps_windowed_sql(self.client, table, historical_start, end_ms, s_ms)
                 

@@ -18,6 +18,7 @@ class MarketConfig(BaseModel):
 
 class BinanceConfig(BaseModel):
     assets: list[str]
+    historical_start_dates: str
     spot: MarketConfig
     um: MarketConfig
     cm: MarketConfig
@@ -43,7 +44,6 @@ class WebSocketConfig(BaseModel):
 class BackfillConfig(BaseModel):
     concurrency_windows: int = 4
     window_minutes: int = 60
-    historical_start_dates: str
 
 
 class AppConfig(BaseModel):
