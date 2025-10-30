@@ -183,8 +183,8 @@ class DataBuffer:
         
         for attempt in range(max_retries):
             try:
-                # 使用异步客户端直接调用
-                await insert_klines(self.clients.get_write(), self.table_name, batch)
+                write_cli = await self.clients.get_write()
+                await insert_klines(write_cli, self.table_name, batch)
                 
                 # 更新统计信息（原子操作）
                 batch_size = len(batch)

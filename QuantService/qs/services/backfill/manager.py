@@ -15,10 +15,10 @@ from ...monitoring.metrics import Metrics
 from ...db.client import ClickHouseClientManager
 
 class BackfillManager:
-    def __init__(self, cfg: AppConfig, clients: ClickHouseClientManager):
+    def __init__(self, cfg: AppConfig, clients: ClickHouseClientManager, read_client: AsyncClickHouseClient):
         self.cfg = cfg
         self.clients = clients
-        self.read_client = clients.get_read()
+        self.read_client = read_client
         self.limiter = ApiRateLimiter(cfg.binance.requests_per_second)
         self._markets_using_proxy: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
         self._markets_tested: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
