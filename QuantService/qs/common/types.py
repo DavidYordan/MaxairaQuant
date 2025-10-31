@@ -27,3 +27,11 @@ class Kline:
     # 买入量（taker）
     taker_buy_base_volume: Decimal
     taker_buy_quote_volume: Decimal
+
+def build_market_symbol(asset: str, market: str | MarketType) -> str:
+    m = market.value if isinstance(market, MarketType) else str(market).lower()
+    base = asset.upper().replace("-", "").replace("/", "")
+    if m == "cm":
+        return f"{base}USD_PERP"
+    else:
+        return f"{base}USDT"

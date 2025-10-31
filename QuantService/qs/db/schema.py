@@ -1,5 +1,6 @@
 from __future__ import annotations
 from .client import AsyncClickHouseClient
+from ..common.types import build_market_symbol
 
 async def ensure_base_tables(client: AsyncClickHouseClient) -> None:
     await client.command(
@@ -89,13 +90,12 @@ async def ensure_bootstrap_defaults(client: AsyncClickHouseClient, assets: list[
     markets = ["spot", "um", "cm"]
     periods = ["1m", "1h"]
     for asset in assets:
-        base = asset.lower()
-        symbol = f"{base}usdt".upper()
         for m in markets:
+            symbol = build_market_symbol(asset, m)
             for p in periods:
                 tbl = kline_table_name(symbol, m, p)
                 await ensure_kline_table(client, tbl)
-            # 仅 ETHUSDT@um 默认启用，其它默认禁用
+            # 仅 ETHUSDT@um 默认启用，其它默认禁用（保持原有逻辑）
             default_enabled = 1 if (symbol == "ETHUSDT" and m == "um") else 0
             await ensure_trading_pair_entry(client, symbol, m, default_enabled)
 

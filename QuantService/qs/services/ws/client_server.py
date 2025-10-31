@@ -9,7 +9,7 @@ from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from loguru import logger
 from ...db.schema import kline_table_name
 from ...db.client import AsyncClickHouseClient
-from ...common.types import Kline
+from ...common.types import Kline, build_market_symbol
 from .event_bus import EventBus
 
 class QueryLimiter:
@@ -235,9 +235,13 @@ class ClientServer:
         return {"ok": True, "cached": False, "rows": rows, "next_open_time_ms": next_cursor}
 
     async def _handle_subscribe_incremental(self, ws: websockets.WebSocketServerProtocol, req: Dict[str, Any], conn_ctx=None):
-        symbol = req["symbol"]
         market = req["market"]
         period = req["period"]
+        asset = req.get("asset")
+        if asset:
+            symbol = build_market_symbol(asset, market)
+        else:
+            symbol = req["symbol"]
         cursor_ms = int(req.get("from_open_time_ms", 0))
         compression = req.get("compression")
         table = kline_table_name(symbol, market, period)

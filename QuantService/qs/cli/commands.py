@@ -21,14 +21,18 @@ def main():
 
     # 手工触发一次回填缺口
     p_bf = sub.add_parser("backfill-gap", help="Backfill a gap window")
-    p_bf.add_argument("--symbol", required=True)
+    # 允许传入资产或符号，优先资产
+    p_bf.add_argument("--asset")
+    p_bf.add_argument("--symbol")
     p_bf.add_argument("--market", choices=["spot", "um", "cm"], required=True)
     p_bf.add_argument("--period", choices=["1m", "1h"], required=True)
     p_bf.add_argument("--start_ms", type=int, required=True)
     p_bf.add_argument("--end_ms", type=int, required=True)
 
     p_ws = sub.add_parser("ws-start", help="Start a WS upstream (temporary)")
-    p_ws.add_argument("--symbol", required=True)
+    # 允许传入资产或符号，优先资产
+    p_ws.add_argument("--asset")
+    p_ws.add_argument("--symbol")
     p_ws.add_argument("--market", choices=["spot", "um", "cm"], required=True)
     p_ws.add_argument("--period", choices=["1m", "1h"], required=True)
 
@@ -74,21 +78,37 @@ def main():
                     logger.info("收到键盘中断")
                 
             elif args.cmd == "backfill-gap":
+                from common.types import MarketType, build_market_symbol
+                # 从资产构造或直接使用符号；资产优先
+                if args.asset:
+                    symbol = build_market_symbol(args.asset, MarketType(args.market))
+                elif args.symbol:
+                    symbol = args.symbol.upper()
+                else:
+                    raise ValueError("必须提供 --asset 或 --symbol")
                 mgr = BackfillManager(cfg, clients.read, clients.backfill)
                 services.append(mgr)
                 await mgr.start()
                 await mgr.backfill_gap(
                     MarketType(args.market), 
-                    args.symbol, 
+                    symbol,
                     args.period, 
                     args.start_ms, 
                     args.end_ms
                 )
             elif args.cmd == "ws-start":
+                from common.types import MarketType, build_market_symbol
+                # 从资产构造或直接使用符号；资产优先
+                if args.asset:
+                    symbol = build_market_symbol(args.asset, MarketType(args.market))
+                elif args.symbol:
+                    symbol = args.symbol.upper()
+                else:
+                    raise ValueError("必须提供 --asset 或 --symbol")
                 sup = WebSocketSupervisor(cfg, clients.read, clients.write, event_bus=bus)
                 services.append(sup)
-                await sup.start_stream(args.market, args.symbol, args.period)
-                logger.info(f"WebSocket流已启动: {args.market} {args.symbol} {args.period}")
+                await sup.start_stream(args.market, symbol, args.period)
+                logger.info(f"WebSocket流已启动: {args.market} {symbol} {args.period}")
                 
                 # 等待中断信号
                 try:
