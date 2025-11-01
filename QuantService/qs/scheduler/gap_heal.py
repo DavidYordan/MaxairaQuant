@@ -220,25 +220,29 @@ class GapHealScheduler:
 
     async def _dispatch_and_release(self, key: str, group: str, market: str, symbol: str, period: str, gs: int, ge: int):
         try:
-            # 将并发限制用于实际执行阶段，避免任务泛滥
             async with self._task_semaphore:
                 logger.info(f"开始回填缺口：{market} {symbol} {period} [{gs},{ge}]")
-                await self.backfill.backfill_gap(
+                summary = await self.backfill.backfill_gap(
                     MarketType(market), symbol, period, gs, ge
                 )
-                logger.info(f"回填完成：{market} {symbol} {period} [{gs},{ge}]")
+                logger.info(f"回填完成：{market} {symbol} {period} [{gs},{ge}] rows={summary.total_rows} ok={summary.all_ok}")
+                # Spot 历史真空缺：API响应正常且无数据 -> 提升水位跳过该缺口
+                try:
+                    if MarketType(market) == MarketType.spot and summary.all_ok and summary.total_rows == 0:
+                        s = step_ms(period)
+                        self._set_hwm(market, symbol, period, ge + s)
+                        logger.info(f"确认空缺窗口，水位前移：{market} {symbol} {period} HWM -> {ge + s}")
+                except Exception as e:
+                    logger.warning(f"提升水位失败（非致命）：{market} {symbol} {period} 错误={e}")
         except Exception as e:
             logger.error(f"回填失败：{market} {symbol} {period} [{gs},{ge}] 错误={e}")
         finally:
-            # 去重标记释放
             self._running_keys.pop(key, None)
-            # 区间去重释放
             ranges = self._running_ranges.get(group)
             if ranges is not None:
                 try:
                     ranges.remove((gs, ge))
                 except ValueError:
-                    # 若对象不在列表（例如边界被调整），以重叠关系清理
                     ranges = [r for r in ranges if not self._overlaps(gs, ge, r[0], r[1])]
                     self._running_ranges[group] = ranges
                 if not ranges:

@@ -13,6 +13,7 @@ from ...services.backfill.fetch import fetch_klines
 from ...services.proxy.registry import get_enabled_proxy_url
 from ...db.schema import kline_table_name
 from ...monitoring.metrics import Metrics
+from dataclasses import dataclass
 
 class BackfillManager:
     def __init__(self):
@@ -69,111 +70,108 @@ class BackfillManager:
 
         logger.info("BackfillManager 已停止")
 
-    async def backfill_gap(self, market: MarketType, symbol: str, period: str, gap_start_ms: int, gap_end_ms: int):
-        """回填数据缺口 - 改进的并发控制和错误处理"""
+    async def backfill_gap(self, market: MarketType, symbol: str, period: str, gap_start_ms: int, gap_end_ms: int) -> BackfillSummary:
+        """回填数据缺口 - 返回窗口处理摘要"""
         logger.info(f"开始回填缺口：{market} {symbol} {period} 范围={gap_start_ms}~{gap_end_ms}")
-        
-        # 首先进行连接探测
         await self._test_market_connection(market, symbol, period)
-        
-        # 预先获取代理URL，避免在并发窗口中重复查询
         proxy_url = await self._select_proxy_url(market)
-        
         table = kline_table_name(symbol, market.value, period)
         windows = self._split_gap(gap_start_ms, gap_end_ms, period)
-        
         if not windows:
             logger.info("没有需要回填的窗口")
-            return
-        
-        # 使用自适应并发控制
+            return BackfillSummary(total_rows=0, windows=0, all_ok=True, empty_all=True)
+
         sem = asyncio.Semaphore(self._adaptive_window_concurrency(table, market))
-        
-        # 创建任务组
+
+        results_tasks: List[asyncio.Task[WindowResult]] = []
         async with asyncio.TaskGroup() as tg:
-            tasks = []
             for i, (ws, we) in enumerate(windows):
-                task = tg.create_task(
+                t = tg.create_task(
                     self._do_window_safe(sem, market, symbol, period, table, ws, we, proxy_url),
                     name=f"window_{market}_{symbol}_{period}_{i}"
                 )
-                tasks.append(task)
-        logger.info(f"回填完成：{market} {symbol} {period} 处理了 {len(windows)} 个窗口")
+                results_tasks.append(t)
 
+        # 汇总结果
+        results: List[WindowResult] = [t.result() for t in results_tasks]
+        total_rows = sum(r.rows_written for r in results)
+        all_ok = all(r.ok for r in results)
+        empty_all = all(r.rows_written == 0 for r in results)
+        logger.info(f"回填完成：{market} {symbol} {period} 处理了 {len(windows)} 个窗口，写入={total_rows} 行")
+        return BackfillSummary(total_rows=total_rows, windows=len(windows), all_ok=all_ok, empty_all=empty_all)
     async def _do_window_safe(self, sem: asyncio.Semaphore, market: MarketType, 
-                             symbol: str, period: str, table: str, ws: int, we: int, proxy_url: Optional[str]):
-        """安全的窗口处理包装器"""
+                             symbol: str, period: str, table: str, ws: int, we: int, proxy_url: Optional[str]) -> WindowResult:
+        """安全的窗口处理包装器，返回窗口结果"""
         try:
-            await self._do_window(sem, market, symbol, period, table, ws, we, proxy_url)
+            return await self._do_window(sem, market, symbol, period, table, ws, we, proxy_url)
         except Exception as e:
-            logger.error(f"窗口处理失败：{market} {symbol} {period} [{ws},{we}] 错误={e}")
-            # 不重新抛出异常，让其他窗口继续处理
-
+            # 理论上 _do_window 已处理异常，这里兜底
+            logger.error(f"窗口处理失败（未捕获异常）：{market} {symbol} {period} [{ws},{we}] 错误={e}")
+            return WindowResult(ok=False, rows_written=0, start_ms=ws, end_ms=we)
     async def _do_window(self, sem: asyncio.Semaphore, market: MarketType, 
-                     symbol: str, period: str, table: str, ws: int, we: int, proxy_url: Optional[str]):
-        """处理单个时间窗口的数据回填"""
-        async with sem:  # 控制并发数
+                     symbol: str, period: str, table: str, ws: int, we: int, proxy_url: Optional[str]) -> WindowResult:
+        """处理单个时间窗口的数据回填，返回窗口结果"""
+        async with sem:
             await self.limiter.acquire()
             try:
                 self.metrics.inc_requests()
-                # limit 使用配置中的 api_max_limit
                 klines, headers = await fetch_klines(
                     market, symbol, period, ws, we, self.api_max_limit, proxy_url
                 )
-                
-                # 更新限流器状态
                 self.limiter.update_from_headers(headers)
                 await self.limiter.maybe_block_by_minute_weight()
-                
-                # 写入数据
-                if klines:
+
+                rows = len(klines) if klines else 0
+                if rows > 0:
                     buf = await self._ensure_buffer(table)
                     await buf.add_many(klines)
-                    
                     self.metrics.inc_successes()
-                    self.metrics.add_inserted_rows(len(klines))
+                    self.metrics.add_inserted_rows(rows)
                     logger.debug(
-                        f"窗口成功：{market} {symbol} {period} [{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ws/1000))},{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(we/1000))}] 写入 {len(klines)} 行"
+                        f"窗口成功：{market} {symbol} {period} "
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ws/1000))},"
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(we/1000))}] 写入 {rows} 行"
                     )
                 else:
-                    logger.warning(f"窗口无数据：{market} {symbol} {period} [{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ws/1000))},{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(we/1000))}]")
-                    
+                    logger.warning(
+                        f"窗口无数据：{market} {symbol} {period} "
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ws/1000))},"
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(we/1000))}]"
+                    )
+                return WindowResult(ok=True, rows_written=rows, start_ms=ws, end_ms=we)
             except Exception as e:
-                await self._handle_window_error(e, market, symbol, period, table, ws, we)
+                res = await self._handle_window_error(e, market, symbol, period, table, ws, we)
+                return res if res is not None else WindowResult(ok=False, rows_written=0, start_ms=ws, end_ms=we)
             finally:
                 self.limiter.release()
 
     async def _handle_window_error(self, error: Exception, market: MarketType, 
-                                  symbol: str, period: str, table: str, ws: int, we: int):
-        """处理窗口错误的统一逻辑"""
+                                  symbol: str, period: str, table: str, ws: int, we: int) -> Optional[WindowResult]:
+        """处理窗口错误的统一逻辑，返回可选窗口结果（重试成功则返回）"""
         response = getattr(error, "response", None)
         status = response.status_code if response is not None else None
-        
-        # 根据错误类型决定处理策略
-        if status in (403, 451):  # 地理限制或禁止访问
+
+        if status in (403, 451):
             self.enable_proxy_for_market(market)
             await asyncio.sleep(0.5)
-            await self._retry_with_proxy(market, symbol, period, table, ws, we)
-            
-        elif status == 429:  # 速率限制
+            return await self._retry_with_proxy(market, symbol, period, table, ws, we)
+
+        elif status == 429:
             retry_after = self._extract_retry_after(error)
-            logger.warning(
-                f"遇到速率限制，等待 {retry_after}s: {market} {symbol} {period} [{ws},{we}]"
-            )
+            logger.warning(f"遇到速率限制，等待 {retry_after}s: {market} {symbol} {period} [{ws},{we}]")
             await asyncio.sleep(retry_after)
-            await self._retry_with_proxy(market, symbol, period, table, ws, we)
-            
-        elif status in (500, 502, 503, 504):  # 服务器错误，可重试
+            return await self._retry_with_proxy(market, symbol, period, table, ws, we)
+
+        elif status in (500, 502, 503, 504):
             await asyncio.sleep(1.0)
-            await self._retry_with_proxy(market, symbol, period, table, ws, we)
-            
-        else:  # 其他错误，记录但不重试
+            return await self._retry_with_proxy(market, symbol, period, table, ws, we)
+
+        else:
             self.metrics.inc_failures()
             logger.error(
-                f"窗口失败：{market} {symbol} {period} [{ws},{we}] "
-                f"状态={status} 错误={error}"
+                f"窗口失败：{market} {symbol} {period} [{ws},{we}] 状态={status} 错误={error}"
             )
-
+            return None
     def _extract_retry_after(self, error: Exception) -> float:
         """从错误响应中提取重试延迟时间"""
         try:
@@ -272,7 +270,7 @@ class BackfillManager:
             logger.info(f"创建数据缓冲区: {table}")
         return buf
 
-    async def _retry_with_proxy(self, market: MarketType, symbol: str, period: str, table: str, ws: int, we: int):
+    async def _retry_with_proxy(self, market: MarketType, symbol: str, period: str, table: str, ws: int, we: int) -> WindowResult:
         await asyncio.sleep(0.5)
         proxy_url = await self._select_proxy_url(market)
         try:
@@ -281,16 +279,20 @@ class BackfillManager:
             )
             self.limiter.update_from_headers(headers)
             await self.limiter.maybe_block_by_minute_weight()
-            buf = await self._ensure_buffer(table)
-            await buf.add_many(klines)
-            self.metrics.inc_successes()
-            self.metrics.add_inserted_rows(len(klines))
-            logger.info("代理重试成功：{} {} {} [{},{}] 写入 {} 行", market, symbol, period, ws, we, len(klines))
+            rows = len(klines) if klines else 0
+            if rows > 0:
+                buf = await self._ensure_buffer(table)
+                await buf.add_many(klines)
+                self.metrics.inc_successes()
+                self.metrics.add_inserted_rows(rows)
+            logger.info("代理重试结果：{} {} {} [{},{}] 写入 {} 行", market, symbol, period, ws, we, rows)
+            return WindowResult(ok=True, rows_written=rows, start_ms=ws, end_ms=we)
         except Exception as e:
             code = getattr(e, "response", None)
             status = code.status_code if code is not None else None
             self.metrics.inc_failures()
             logger.error("代理重试失败：{} {} {} [{},{}] 状态={} 错误={}", market, symbol, period, ws, we, status, str(e))
+            return WindowResult(ok=False, rows_written=0, start_ms=ws, end_ms=we)
 
     def get_buffer_statuses(self) -> Dict[str, dict]:
         """用于指标采集的缓冲区状态快照"""
@@ -346,3 +348,18 @@ class BackfillManager:
         if concurrency != base:
             logger.info(f"自适应并发：{table} base={base} -> concurrency={concurrency}")
         return concurrency
+
+
+@dataclass
+class WindowResult:
+    ok: bool
+    rows_written: int
+    start_ms: int
+    end_ms: int
+
+@dataclass
+class BackfillSummary:
+    total_rows: int
+    windows: int
+    all_ok: bool
+    empty_all: bool
