@@ -12,7 +12,7 @@ app:
     assets: ["btc", "eth"]
     spot:
       ws_url: "wss://stream.binance.com:9443/ws/"
-      rest_url: "https://data-api.binance.vision/api/v3/klines"
+      rest_url: "https://api.binance.com/api/v3/klines"
     um:
       ws_url: "wss://fstream.binance.com/ws/"
       rest_url: "https://fapi.binance.com/fapi/v1/klines"

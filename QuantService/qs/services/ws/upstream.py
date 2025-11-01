@@ -3,15 +3,20 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import os
+import ssl
+import websockets
+from loguru import logger
+from urllib.parse import urlparse
+from python_socks.async_.asyncio import Proxy
 from decimal import Decimal
 from typing import Optional, List
 
-import websockets
-from loguru import logger
 
 from ...common.types import Kline
 from ...db.queries import insert_klines
 from ...gateways.binance_ws import build_subscription_url
+from ...services.proxy.registry import get_enabled_proxy_url
 from ...services.ws.event_bus import EventBus
 
 
@@ -151,7 +156,8 @@ class UpstreamStream:
     async def _run_connection(self) -> None:
         """真正的一次连接"""
         url = build_subscription_url(self.base_ws_url, self.symbol, self.period)
-        logger.info(f"WS 连接中：{self.symbol} {self.period} -> {url}")
+        proxy_url = await get_enabled_proxy_url()
+        logger.info(f"WS 连接中：{self.symbol} {self.period} -> {url} (proxy: {proxy_url or 'DIRECT'})")
 
         connect_options = {
             "close_timeout": 10,
@@ -161,16 +167,43 @@ class UpstreamStream:
         }
 
         try:
-            ws = await asyncio.wait_for(
-                websockets.connect(url, **connect_options),
-                timeout=30.0,
-            )
+            try:
+                # 优先尝试 websockets 的内置 proxy 参数（新版本支持）
+                ws = await asyncio.wait_for(
+                    websockets.connect(url, proxy=proxy_url, **connect_options),
+                    timeout=30.0,
+                )
+            except TypeError as te:
+                # 不支持 proxy 参数则回退到 socket 代理方式
+                logger.debug(f"websockets.connect 不支持 proxy 参数，回退 socket 代理: {te}")
+                ws = await self._connect_via_proxy_socket(url, proxy_url, connect_options)
         except asyncio.TimeoutError:
             raise Exception("WebSocket连接超时")
 
         # 用 async with 来确保退出时关闭
         async with ws:
             await self._handle_connection(ws)
+
+    async def _connect_via_proxy_socket(self, url: str, proxy_url: str, connect_options: dict):
+        """使用 python-socks 通过代理建立 socket，再交由 websockets 完成握手"""
+
+        parts = urlparse(url)
+        host = parts.hostname
+        port = parts.port or (443 if parts.scheme == "wss" else 80)
+
+        proxy = Proxy.from_url(proxy_url)  # type: ignore[arg-type]
+        sock = await proxy.connect(dest_host=host, dest_port=port)
+
+        kwargs = {"sock": sock}
+        if parts.scheme == "wss":
+            kwargs["ssl"] = ssl.create_default_context()
+            kwargs["server_hostname"] = host
+
+        ws = await asyncio.wait_for(
+            websockets.connect(url, **connect_options, **kwargs),
+            timeout=30.0,
+        )
+        return ws
 
     async def _handle_connection(self, ws) -> None:
         """收到消息就处理，保活交给 websockets"""
