@@ -19,4 +19,4 @@ app:
     cm:
       ws_url: "wss://dstream.binance.com/ws/"
       rest_url: "https://dapi.binance.com/dapi/v1/klines"
-    historical_start_dates: "2020-01-01"
+    historical_start_dates: "2021-01-01"
