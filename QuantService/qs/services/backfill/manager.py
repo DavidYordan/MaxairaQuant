@@ -5,7 +5,7 @@ from loguru import logger
 import time
 from ...buffer.buffer import DataBuffer
 from ...common.types import MarketType
-from ...config.schema import AppConfig
+from ...config.loader import get_config
 from ...gateways.binance_rest import step_ms
 from ...services.backfill.fetch import aclose_all_clients
 from ...services.backfill.rate_limiter import ApiRateLimiter
@@ -13,20 +13,20 @@ from ...services.backfill.fetch import fetch_klines
 from ...services.proxy.registry import get_enabled_proxy_url
 from ...db.schema import kline_table_name
 from ...monitoring.metrics import Metrics
-from ...db.client import ClickHouseClientManager
 
 class BackfillManager:
-    def __init__(self, cfg: AppConfig, clients: ClickHouseClientManager, read_client: AsyncClickHouseClient):
-        self.cfg = cfg
-        self.clients = clients
-        self.read_client = read_client
-        self.limiter = ApiRateLimiter(cfg.binance.requests_per_second)
-        self._markets_using_proxy: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
-        self._markets_tested: Dict[MarketType, bool] = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
+    def __init__(self):
+        cfg = get_config()
+        self.api_max_limit = cfg.binance.api_max_limit
+        self.buffer_batch_size = cfg.buffer.batch_size
+        self.buffer_flush_interval_ms = cfg.buffer.flush_interval_ms
+        self.limiter = ApiRateLimiter()
+        self._markets_using_proxy = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
+        self._markets_tested = {MarketType.spot: False, MarketType.um: False, MarketType.cm: False}
         self._window_concurrency = cfg.backfill.concurrency_windows
         self.metrics = Metrics()
-        self._buffers: Dict[str, DataBuffer] = {}
-        self._market_test_locks: Dict[MarketType, asyncio.Lock] = {
+        self._buffers = {}
+        self._market_test_locks = {
             MarketType.spot: asyncio.Lock(),
             MarketType.um: asyncio.Lock(),
             MarketType.cm: asyncio.Lock(),
@@ -86,8 +86,8 @@ class BackfillManager:
             logger.info("没有需要回填的窗口")
             return
         
-        # 使用信号量控制并发，减少并发数
-        sem = asyncio.Semaphore(min(self._window_concurrency, 2))  # 最多2个并发窗口
+        # 使用自适应并发控制
+        sem = asyncio.Semaphore(self._adaptive_window_concurrency(table, market))
         
         # 创建任务组
         async with asyncio.TaskGroup() as tg:
@@ -98,7 +98,6 @@ class BackfillManager:
                     name=f"window_{market}_{symbol}_{period}_{i}"
                 )
                 tasks.append(task)
-        
         logger.info(f"回填完成：{market} {symbol} {period} 处理了 {len(windows)} 个窗口")
 
     async def _do_window_safe(self, sem: asyncio.Semaphore, market: MarketType, 
@@ -111,19 +110,15 @@ class BackfillManager:
             # 不重新抛出异常，让其他窗口继续处理
 
     async def _do_window(self, sem: asyncio.Semaphore, market: MarketType, 
-                        symbol: str, period: str, table: str, ws: int, we: int, proxy_url: Optional[str]):
+                     symbol: str, period: str, table: str, ws: int, we: int, proxy_url: Optional[str]):
         """处理单个时间窗口的数据回填"""
         async with sem:  # 控制并发数
-            # 获取API限流令牌
             await self.limiter.acquire()
-            
             try:
-                # 使用预先获取的代理URL，避免重复查询数据库
                 self.metrics.inc_requests()
-                
-                # 获取数据
+                # limit 使用配置中的 api_max_limit
                 klines, headers = await fetch_klines(
-                    self.cfg, market, symbol, period, ws, we, 1000, proxy_url
+                    market, symbol, period, ws, we, self.api_max_limit, proxy_url
                 )
                 
                 # 更新限流器状态
@@ -191,7 +186,8 @@ class BackfillManager:
 
     def _window_size_ms(self, period: str) -> int:
         """计算窗口大小（毫秒）"""
-        return step_ms(period) * 1000  # 使用1000作为默认API限制
+        # 每次请求最大根数由配置决定
+        return step_ms(period) * self.api_max_limit
 
     def _split_gap(self, start_ms: int, end_ms: int, period: str) -> List[Tuple[int, int]]:
         """将缺口分割为多个时间窗口"""
@@ -207,7 +203,7 @@ class BackfillManager:
     async def _select_proxy_url(self, market: MarketType) -> Optional[str]:
         """选择代理URL"""
         if self._markets_using_proxy.get(market, False):
-            return await get_enabled_proxy_url(self.read_client)
+            return await get_enabled_proxy_url()
         return None
 
     def enable_proxy_for_market(self, market: MarketType):
@@ -223,7 +219,6 @@ class BackfillManager:
                 return
 
             logger.info(f"正在测试市场连接：{market}")
-            import time
             end_ms = int(time.time() * 1000)
             start_ms = end_ms - step_ms(period) * 5  # 测试5个周期的数据
 
@@ -232,7 +227,7 @@ class BackfillManager:
                 await self.limiter.acquire()
                 try:
                     klines, headers = await fetch_klines(
-                        self.cfg, market, symbol, period, start_ms, end_ms, 5, None
+                        market, symbol, period, start_ms, end_ms, 5, None
                     )
                     self.limiter.update_from_headers(headers)
                     logger.info(f"市场 {market} 连接正常，无需代理")
@@ -249,7 +244,7 @@ class BackfillManager:
                         proxy_url = await self._select_proxy_url(market)
                         if proxy_url:
                             klines, headers = await fetch_klines(
-                                self.cfg, market, symbol, period, start_ms, end_ms, 5, proxy_url
+                                market, symbol, period, start_ms, end_ms, 5, proxy_url
                             )
                             self.limiter.update_from_headers(headers)
                             logger.info(f"市场 {market} 代理连接测试成功")
@@ -267,7 +262,11 @@ class BackfillManager:
         """确保数据缓冲区存在并已启动"""
         buf = self._buffers.get(table)
         if not buf:
-            buf = DataBuffer(table_name=table, clients=self.clients)
+            buf = DataBuffer(
+                table_name=table,
+                batch_size=self.buffer_batch_size,
+                flush_interval_ms=self.buffer_flush_interval_ms
+            )
             self._buffers[table] = buf
             await buf.start()
             logger.info(f"创建数据缓冲区: {table}")
@@ -277,7 +276,9 @@ class BackfillManager:
         await asyncio.sleep(0.5)
         proxy_url = await self._select_proxy_url(market)
         try:
-            klines, headers = await fetch_klines(self.cfg, market, symbol, period, ws, we, 1000, proxy_url)
+            klines, headers = await fetch_klines(
+                market, symbol, period, ws, we, self.api_max_limit, proxy_url
+            )
             self.limiter.update_from_headers(headers)
             await self.limiter.maybe_block_by_minute_weight()
             buf = await self._ensure_buffer(table)
@@ -294,3 +295,54 @@ class BackfillManager:
     def get_buffer_statuses(self) -> Dict[str, dict]:
         """用于指标采集的缓冲区状态快照"""
         return {table: buf.status() for table, buf in self._buffers.items()}
+
+    def _adaptive_window_concurrency(self, table: str, market: MarketType) -> int:
+        """根据系统压力自适应窗口并发数"""
+        base = max(1, int(self._window_concurrency))
+        concurrency = base
+
+        # 1) 分钟权重压力
+        try:
+            used = self.limiter.get_used_weight_minute()
+            thr = max(1, self.limiter.get_minute_block_threshold())
+            ratio = used / thr
+            if ratio >= 0.95:
+                concurrency = max(1, base // 4)  # 极限降级
+            elif ratio >= 0.80:
+                concurrency = max(1, base // 2)  # 温和降级
+        except Exception:
+            pass
+
+        # 2) 缓冲队列压力（针对目标表）
+        try:
+            buf = self._buffers.get(table)
+            if buf:
+                st = buf.status()
+                qsize = int(st.get("writer_queue_size", 0))
+                qcap = int(st.get("max_queue_size", 1))
+                pressure = qsize / qcap if qcap > 0 else 0.0
+                if pressure >= 0.80:
+                    concurrency = 1
+                elif pressure >= 0.60:
+                    concurrency = max(1, concurrency // 2)
+        except Exception:
+            pass
+
+        # 3) 故障率（全局粗粒度）
+        try:
+            req = max(1, int(self.metrics.requests))
+            fail = int(self.metrics.failures)
+            if req >= 10 and (fail / req) >= 0.15:
+                concurrency = max(1, concurrency // 2)
+        except Exception:
+            pass
+
+        # 4) 代理路径：保守降级
+        if self._markets_using_proxy.get(market, False):
+            concurrency = max(1, concurrency // 2)
+
+        # 归一化
+        concurrency = max(1, min(concurrency, base))
+        if concurrency != base:
+            logger.info(f"自适应并发：{table} base={base} -> concurrency={concurrency}")
+        return concurrency

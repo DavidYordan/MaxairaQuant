@@ -1,11 +1,12 @@
 from __future__ import annotations
 import asyncio
 import time
+from ...config.loader import get_config
 
 class ApiRateLimiter:
-    def __init__(self, rps: int, minute_block_threshold: int = 1150):
-        self._rps = rps
-        self._tokens = asyncio.Queue(maxsize=rps)
+    def __init__(self, minute_block_threshold: int = 1150):
+        self._rps = get_config().binance.requests_per_second
+        self._tokens = asyncio.Queue(maxsize=self._rps)
         self._refill_task = None
         self._used_weight_minute: int = 0
         self._minute_block_threshold = minute_block_threshold
@@ -62,3 +63,9 @@ class ApiRateLimiter:
                 await self._fill()
         except asyncio.CancelledError:
             pass
+
+    def get_used_weight_minute(self) -> int:
+        return self._used_weight_minute
+
+    def get_minute_block_threshold(self) -> int:
+        return self._minute_block_threshold

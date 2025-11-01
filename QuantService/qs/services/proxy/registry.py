@@ -1,40 +1,33 @@
 from __future__ import annotations
-import asyncio
 import time
-from ...db.client import AsyncClickHouseClient
+from ...db.client import AsyncClickHouseClient, get_client_manager
 from typing import Optional, Tuple
 from loguru import logger
 
 
 class ProxyRegistry:
     """代理配置注册表 - 带缓存和独立连接"""
-    
     def __init__(self):
         self._cache: Optional[Tuple[str, int, str, str, float]] = None  # (host, port, username, password, cache_time)
         self._cache_ttl = 60.0  # 缓存60秒
     
-    async def get_enabled_proxy_url(self, client: AsyncClickHouseClient) -> Optional[str]:
+    async def get_enabled_proxy_url(self) -> Optional[str]:
         """获取启用的代理URL，带缓存机制"""
         try:
             now = time.time()
-            
-            # 检查缓存是否有效
             if self._cache and (now - self._cache[4]) < self._cache_ttl:
                 host, port, username, password = self._cache[:4]
                 return self._build_proxy_url(host, port, username, password)
-            
-            # 缓存过期或不存在，重新查询
-            rec = await self._get_latest_enabled_proxy_safe(client)
+
+            # 按需拉取 read client
+            read_client = await get_client_manager().get_read()
+            rec = await self._get_latest_enabled_proxy_safe(read_client)
             if rec is None:
                 self._cache = None
                 return None
-            
             host, port, username, password = rec
-            # 更新缓存
             self._cache = (host, port, username, password, now)
-            
             return self._build_proxy_url(host, port, username, password)
-                
         except Exception as e:
             logger.error(f"获取代理URL失败: {e}")
             return None
@@ -50,7 +43,6 @@ class ProxyRegistry:
     async def _get_latest_enabled_proxy_safe(self, client: AsyncClickHouseClient) -> Tuple[str, int, str | None, str | None] | None:
         """安全的代理配置查询，避免并发冲突"""
         try:
-            # 使用简单的查询避免复杂的并发问题
             rs = await client.query(
                 """SELECT host, port, username, password 
                 FROM proxy_config 
@@ -58,13 +50,10 @@ class ProxyRegistry:
                 ORDER BY updated_at DESC 
                 LIMIT 1"""
             )
-            
             if not rs.result_rows:
                 return None
-                
             host, port, username, password = rs.result_rows[0]
             return str(host), int(port), (username or None), (password or None)
-            
         except Exception as e:
             logger.error(f"获取代理配置失败: {e}")
             return None
@@ -78,9 +67,9 @@ class ProxyRegistry:
 _proxy_registry = ProxyRegistry()
 
 
-async def get_enabled_proxy_url(client: AsyncClickHouseClient) -> Optional[str]:
+async def get_enabled_proxy_url() -> Optional[str]:
     """获取启用的代理URL - 兼容性接口"""
-    return await _proxy_registry.get_enabled_proxy_url(client)
+    return await _proxy_registry.get_enabled_proxy_url()
 
 
 def invalidate_proxy_cache():

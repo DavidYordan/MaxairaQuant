@@ -8,8 +8,8 @@ import websockets
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from loguru import logger
 from ...db.schema import kline_table_name
-from ...db.client import AsyncClickHouseClient
-from ...common.types import Kline, build_market_symbol
+from ...db.client import get_client_manager
+from ...common.types import build_market_symbol
 from .event_bus import EventBus
 
 class QueryLimiter:
@@ -75,8 +75,7 @@ class HotCache:
         return end_ms >= now_ms - self._window_ms
 
 class ClientServer:
-    def __init__(self, ch_client: AsyncClickHouseClient, host: str = "0.0.0.0", port: int = 8765, qps: int = 20, hot_hours: int = 6, cache_ttl_s: float = 5.0, auth_required: bool = True, default_qps: int = 20, max_page_size: int = 2000, max_subscriptions: int = 2, min_poll_interval_ms: int = 500, event_bus: Optional[EventBus] = None):
-        self.client = ch_client
+    def __init__(self, host: str = "0.0.0.0", port: int = 8765, qps: int = 20, hot_hours: int = 6, cache_ttl_s: float = 5.0, auth_required: bool = True, default_qps: int = 20, max_page_size: int = 2000, max_subscriptions: int = 2, min_poll_interval_ms: int = 500, event_bus: Optional[EventBus] = None):
         self.host = host
         self.port = port
         self._server: Optional[websockets.server.Serve] = None
@@ -91,6 +90,7 @@ class ClientServer:
         self.event_bus = event_bus
 
     async def start(self):
+        # 初始化限流与读客户端
         await self._limiter.start()
         self._server = await websockets.serve(self._handler, self.host, self.port, ping_interval=20, ping_timeout=20, max_queue=1024)
         logger.info("ClientServer 启动：ws://{}:{}/", self.host, self.port)
@@ -257,8 +257,8 @@ class ClientServer:
                 await self._limiter.acquire()
                 if conn_ctx and conn_ctx.limiter:
                     await conn_ctx.limiter.acquire()
-                batch: List[Kline] = await q.get()
-                # 过滤掉游标之前的数据
+                payload = await q.get()  # 可能是 Kline 或 List[Kline]
+                batch = payload if isinstance(payload, list) else [payload]
                 out: List[Dict[str, Any]] = []
                 for k in batch:
                     if k.open_time_ms < cursor_ms:
@@ -285,7 +285,8 @@ class ClientServer:
             self.event_bus.unsubscribe(table, q)
 
     async def _fetch_page(self, table: str, start_ms: int, end_ms: int, limit: int) -> List[Dict[str, Any]]:
-        rs = await self.client.query(
+        read_client = get_client_manager().get_read()
+        rs = await read_client.query(
             f"""
             SELECT
               open_time, close_time, toString(open), toString(high), toString(low), toString(close),
@@ -316,7 +317,8 @@ class ClientServer:
 
     async def _validate_api_key(self, api_key: str) -> Tuple[bool, int]:
         try:
-            rs = await self.client.query(
+            read_client = get_client_manager().get_read()
+            rs = await read_client.query(
                 "SELECT enabled, qps_limit FROM api_keys WHERE api_key = %(k)s LIMIT 1",
                 parameters={"k": api_key},
             )

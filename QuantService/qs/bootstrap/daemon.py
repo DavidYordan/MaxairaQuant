@@ -1,8 +1,6 @@
 import asyncio
-from pathlib import Path
 from loguru import logger
-from ..config.loader import load_config
-from ..db.client import ClickHouseClientManager
+from ..db.client import get_client_manager, close_all_clients
 from ..db.schema import ensure_base_tables, ensure_bootstrap_defaults, ensure_indicator_tables, ensure_backtest_tables, ensure_indicator_views_for_pairs
 from ..db.queries import get_enabled_pairs
 from ..services.backfill.manager import BackfillManager
@@ -12,32 +10,28 @@ from ..services.ws.client_server import ClientServer
 from ..services.indicator.online import IndicatorOnlineService
 from ..services.ws.event_bus import EventBus
 
-async def run_daemon(cfg_path: Path | str = None):
+async def run_daemon():
     # 1) 配置与DB
-    cfg_path = cfg_path or (Path(__file__).parents[2] / "config" / "app.yaml")
-    cfg = load_config(cfg_path)
-    clients = ClickHouseClientManager(cfg.clickhouse)
+    await get_client_manager().init_base()
 
-    read_cli = await clients.get_read()
-    write_cli = await clients.get_write()
+    # 基础表与视图
+    await ensure_base_tables()
+    await ensure_bootstrap_defaults()
+    await ensure_indicator_tables()
+    await ensure_backtest_tables()
 
-    await ensure_base_tables(write_cli)
-    await ensure_bootstrap_defaults(write_cli, cfg.binance.assets)
-    await ensure_indicator_tables(write_cli)
-    await ensure_backtest_tables(write_cli)
-
-    pairs = await get_enabled_pairs(read_cli)
-    await ensure_indicator_views_for_pairs(write_cli, pairs, ["1m", "1h"])
+    pairs = await get_enabled_pairs()
+    await ensure_indicator_views_for_pairs(pairs, ["1m", "1h"])
 
     # 4) 组装各服务
     event_bus = EventBus()
-    backfill = BackfillManager(cfg, clients, read_cli)
-    scheduler = GapHealScheduler(cfg, read_cli, backfill)
-    ws_sup = WebSocketSupervisor(cfg, read_cli, write_cli, event_bus=event_bus)
-    ind_on = IndicatorOnlineService(read_cli, write_cli)
-    client_srv = ClientServer(read_cli, event_bus=event_bus)
+    backfill = BackfillManager()
+    scheduler = GapHealScheduler(backfill)
+    ws_sup = WebSocketSupervisor(event_bus=event_bus)
+    ind_on = IndicatorOnlineService()
+    client_srv = ClientServer(event_bus=event_bus)
 
-    # 5) 启动顺序（所有 DB 初始化后再启动服务）
+    # 5) 启动顺序
     await backfill.start()
     await scheduler.start()
     await ws_sup.start_enabled_streams()
@@ -114,12 +108,8 @@ async def run_daemon(cfg_path: Path | str = None):
         await client_srv.stop()
         await ind_on.stop()
         await scheduler.stop()
+        await ws_sup.stop_all_streams()
         await backfill.stop()
         # 关闭监控任务与数据库连接
         delay_task.cancel()
-        try:
-            await clients.read.close()
-            await clients.write.close()
-            await clients.backfill.close()
-        except Exception as e:
-            logger.warning("关闭 ClickHouse 客户端失败: {}", e)
+        await close_all_clients()

@@ -10,7 +10,7 @@ import websockets
 from loguru import logger
 
 from ...common.types import Kline
-from ...db.client import AsyncClickHouseClient
+from ...db.queries import insert_klines
 from ...gateways.binance_ws import build_subscription_url
 from ...services.ws.event_bus import EventBus
 
@@ -21,7 +21,6 @@ class UpstreamStream:
         base_ws_url: str,
         symbol: str,
         period: str,
-        write_client: AsyncClickHouseClient,
         table_name: str,
         event_bus: EventBus,
         heartbeat_timeout_ms: int = 60000,
@@ -31,11 +30,8 @@ class UpstreamStream:
         self.base_ws_url = base_ws_url
         self.symbol = symbol
         self.period = period
-
-        self.write_client = write_client
         self.table_name = table_name
         self.event_bus = event_bus
-
         self.heartbeat_timeout_ms = heartbeat_timeout_ms
         self.initial_backoff_ms = initial_backoff_ms
         self.max_backoff_ms = max_backoff_ms
@@ -214,7 +210,7 @@ class UpstreamStream:
 
                 # 写入数据库
                 try:
-                    await self._insert_klines_direct(batch_to_write)
+                    await insert_klines(self.table_name, batch_to_write)
                 except Exception as e:
                     logger.error(f"WS数据直接写入失败: {self.table_name} {e}")
                     # 写失败就别发事件了
@@ -225,46 +221,7 @@ class UpstreamStream:
                 break
             except Exception as e:
                 logger.error(f"WS 写入循环异常: {self.table_name} {e}")
-
-    async def _insert_klines_direct(self, klines: List[Kline]) -> None:
-        """直接写 ClickHouse"""
-        if not klines:
-            return
-
-        data = [
-            [
-                k.open_time_ms,
-                k.close_time_ms,
-                str(k.open),
-                str(k.high),
-                str(k.low),
-                str(k.close),
-                str(k.volume),
-                str(k.quote_volume),
-                k.count,
-                str(k.taker_buy_base_volume),
-                str(k.taker_buy_quote_volume),
-            ]
-            for k in klines
-        ]
-
-        column_names = [
-            "open_time",
-            "close_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "quote_volume",
-            "count",
-            "taker_buy_base_volume",
-            "taker_buy_quote_volume",
-        ]
-
-        await self.write_client.insert(self.table_name, data, column_names=column_names)
-        logger.debug(f"WS 直写 {len(klines)} 条数据到 {self.table_name}")
-
+    
     # -------------------------------------------------------------------------
     # message handler
     # -------------------------------------------------------------------------

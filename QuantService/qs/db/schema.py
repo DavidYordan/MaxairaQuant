@@ -1,8 +1,10 @@
 from __future__ import annotations
-from .client import AsyncClickHouseClient
 from ..common.types import build_market_symbol
+from ..config.loader import get_config
+from .client import get_client_manager
 
-async def ensure_base_tables(client: AsyncClickHouseClient) -> None:
+async def ensure_base_tables() -> None:
+    client = await get_client_manager().get_write()
     await client.command(
         """
         CREATE TABLE IF NOT EXISTS trading_pair_config
@@ -47,7 +49,8 @@ async def ensure_base_tables(client: AsyncClickHouseClient) -> None:
         """
     )
 
-async def ensure_kline_table(client: AsyncClickHouseClient, table_name: str) -> None:
+async def ensure_kline_table(table_name: str) -> None:
+    client = await get_client_manager().get_write()
     await client.command(
         f"""
         CREATE TABLE IF NOT EXISTS {table_name}
@@ -70,23 +73,27 @@ async def ensure_kline_table(client: AsyncClickHouseClient, table_name: str) -> 
         """
     )
 
-async def ensure_trading_pair_entry(client: AsyncClickHouseClient, symbol: str, market_type: str, enabled: int) -> None:
-    rs = await client.query(
+async def ensure_trading_pair_entry(symbol: str, market_type: str, enabled: int) -> None:
+    mgr = get_client_manager()
+    read_cli = await mgr.get_read()
+    rs = await read_cli.query(
         "SELECT count() FROM trading_pair_config WHERE symbol = %(s)s AND market_type = %(m)s",
         parameters={"s": symbol, "m": market_type},
     )
     cnt = int(rs.result_rows[0][0]) if rs.result_rows else 0
     if cnt == 0:
-        rs2 = await client.query("SELECT coalesce(max(id), 0) FROM trading_pair_config")
+        rs2 = await read_cli.query("SELECT coalesce(max(id), 0) FROM trading_pair_config")
         max_id = int(rs2.result_rows[0][0]) if rs2.result_rows else 0
         new_id = max_id + 1
-        await client.insert(
+        write_cli = await mgr.get_write()
+        await write_cli.insert(
             "trading_pair_config",
             [[new_id, symbol, market_type, int(enabled)]],
             column_names=["id", "symbol", "market_type", "enabled"],
         )
 
-async def ensure_bootstrap_defaults(client: AsyncClickHouseClient, assets: list[str]) -> None:
+async def ensure_bootstrap_defaults() -> None:
+    assets = get_config().binance.assets
     markets = ["spot", "um", "cm"]
     periods = ["1m", "1h"]
     for asset in assets:
@@ -94,12 +101,12 @@ async def ensure_bootstrap_defaults(client: AsyncClickHouseClient, assets: list[
             symbol = build_market_symbol(asset, m)
             for p in periods:
                 tbl = kline_table_name(symbol, m, p)
-                await ensure_kline_table(client, tbl)
-            # 仅 ETHUSDT@um 默认启用，其它默认禁用（保持原有逻辑）
+                await ensure_kline_table(tbl)
             default_enabled = 1 if (symbol == "ETHUSDT" and m == "um") else 0
-            await ensure_trading_pair_entry(client, symbol, m, default_enabled)
+            await ensure_trading_pair_entry(symbol, m, default_enabled)
 
-async def ensure_indicator_tables(client: AsyncClickHouseClient) -> None:
+async def ensure_indicator_tables() -> None:
+    client = await get_client_manager().get_write()
     await client.command(
         """
         CREATE TABLE IF NOT EXISTS indicator_ma
@@ -116,7 +123,8 @@ async def ensure_indicator_tables(client: AsyncClickHouseClient) -> None:
         """
     )
 
-async def ensure_indicator_view_for_table(client: AsyncClickHouseClient, symbol: str, market: str, period: str) -> None:
+async def ensure_indicator_view_for_table(symbol: str, market: str, period: str) -> None:
+    client = await get_client_manager().get_write()
     table = kline_table_name(symbol, market, period)
     view_name = indicator_view_name(symbol, market, period)
     await client.command(
@@ -134,12 +142,13 @@ async def ensure_indicator_view_for_table(client: AsyncClickHouseClient, symbol:
         """
     )
 
-async def ensure_indicator_views_for_pairs(client: AsyncClickHouseClient, pairs: list[tuple[str, str]], periods: list[str]) -> None:
+async def ensure_indicator_views_for_pairs(pairs: list[tuple[str, str]], periods: list[str]) -> None:
     for symbol, market in pairs:
         for period in periods:
-            await ensure_indicator_view_for_table(client, symbol, market, period)
-            
-async def ensure_backtest_tables(client: AsyncClickHouseClient) -> None:
+            await ensure_indicator_view_for_table(symbol, market, period)
+
+async def ensure_backtest_tables() -> None:
+    client = await get_client_manager().get_write()
     await client.command(
         """
         CREATE TABLE IF NOT EXISTS backtest_results

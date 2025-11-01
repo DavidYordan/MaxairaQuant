@@ -1,14 +1,15 @@
 from __future__ import annotations
 from ..common.types import MarketType
-from ..config.schema import AppConfig
+from ..config.loader import get_config
 
-def ws_base_url(cfg: AppConfig, market: MarketType) -> str:
+def ws_base_url(market: MarketType) -> str:
+    cfg = get_config().binance
     if market == MarketType.spot:
-        return cfg.binance.spot.ws_url
+        return cfg.spot.ws_url
     elif market == MarketType.um:
-        return cfg.binance.um.ws_url
+        return cfg.um.ws_url
     else:
-        return cfg.binance.cm.ws_url
+        return cfg.cm.ws_url
 
 def build_subscription_url(base: str, symbol: str, period: str) -> str:
     if not base.endswith("/"):

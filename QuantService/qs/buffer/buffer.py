@@ -3,19 +3,16 @@ import asyncio
 import logging
 from typing import List, Optional
 from ..common.types import Kline
-from ..db.queries import insert_klines
-from ..db.client import ClickHouseClientManager
+from ..db.queries import insert_klines_bulk
 
 
 class DataBuffer:
-    def __init__(self, table_name: str, clients: ClickHouseClientManager, batch_size: int = 2000,
-                flush_interval_ms: int = 1500, writer_workers: int = 4, max_queue_size: int = 20000
-                 ):
-        self.clients = clients
+    def __init__(self, table_name: str, batch_size: int = 2000,
+                flush_interval_ms: int = 1500, writer_workers: int = 4, max_queue_size: int = 20000):
         self.table_name = table_name
         self.batch_size = batch_size
         self.flush_interval_ms = flush_interval_ms
-        self.writer_workers = writer_workers  # 多写入器支持
+        self.writer_workers = writer_workers
         self.max_queue_size = max_queue_size
         
         self._buf: List[Kline] = []
@@ -154,14 +151,26 @@ class DataBuffer:
         try:
             self._write_q.put_nowait(batch)
         except asyncio.QueueFull:
-            # 队列满时的处理策略：丢弃最老的批次
+            # 优先尝试短暂等待队列释放空间，避免直接丢批次
+            try:
+                await asyncio.wait_for(self._write_q.put(batch), timeout=0.25)
+                return
+            except asyncio.TimeoutError:
+                pass
+            # 队列仍满：丢弃最老的批次以腾挪空间，再追加当前批次
             try:
                 self._write_q.get_nowait()  # 移除最老的
-                self._write_q.put_nowait(batch)  # 添加新的
                 self._stats['queue_full_drops'] += 1
                 self.logger.warning(f"Queue full, dropped oldest batch. Total drops: {self._stats['queue_full_drops']}")
             except asyncio.QueueEmpty:
+                # 极端情况：队列状态竞争
                 pass
+            try:
+                self._write_q.put_nowait(batch)
+            except asyncio.QueueFull:
+                # 极端拥堵：保护性降级，避免死锁（丢弃当前批次）
+                self._stats['queue_full_drops'] += 1
+                self.logger.error(f"Queue still full; dropped incoming batch. Total drops: {self._stats['queue_full_drops']}")
 
     async def _flush_loop(self):
         """定时刷新循环"""
@@ -178,13 +187,10 @@ class DataBuffer:
         """带重试的写入逻辑，增强错误处理和性能优化"""
         if not batch:
             return
-            
-        retry_delays = [0.5, 1.0, 2.0, 4.0, 8.0]  # 指数退避延迟
-        
+        retry_delays = [0.5, 1.0, 2.0, 4.0, 8.0]
         for attempt in range(max_retries):
             try:
-                write_cli = await self.clients.get_write()
-                await insert_klines(write_cli, self.table_name, batch)
+                await insert_klines_bulk(self.table_name, batch)
                 
                 # 更新统计信息（原子操作）
                 batch_size = len(batch)

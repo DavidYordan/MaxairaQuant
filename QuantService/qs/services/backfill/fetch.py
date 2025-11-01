@@ -38,7 +38,6 @@ async def aclose_all_clients() -> None:
             _CLIENTS.pop(key, None)
 
 async def fetch_klines(
-    cfg: AppConfig,
     market: MarketType,
     symbol: str,
     period: str,
@@ -47,7 +46,7 @@ async def fetch_klines(
     limit: int,
     proxy_url: Optional[str],
 ) -> Tuple[List[Kline], dict]:
-    url = rest_url(cfg, market)
+    url = rest_url(market)
     params = build_params(symbol, period, start_ms, end_ms, limit)
 
     client = _get_client(proxy_url)

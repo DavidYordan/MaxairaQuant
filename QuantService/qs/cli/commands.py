@@ -1,13 +1,11 @@
 import argparse
 import asyncio
-from config.loader import load_config
-from db.client import get_clients
 from loguru import logger
-from services.backfill.manager import BackfillManager
-from services.ws.supervisor import WebSocketSupervisor
-from services.ws.client_server import ClientServer
-from services.ws.event_bus import EventBus
-from common.types import MarketType
+from qs.services.backfill.manager import BackfillManager
+from qs.services.ws.supervisor import WebSocketSupervisor
+from qs.services.ws.client_server import ClientServer
+from qs.services.ws.event_bus import EventBus
+from qs.common.types import MarketType, build_market_symbol
 
 def main():
     parser = argparse.ArgumentParser(prog="qs-cli", description="QuantService CLI")
@@ -37,20 +35,14 @@ def main():
     p_ws.add_argument("--period", choices=["1m", "1h"], required=True)
 
     args = parser.parse_args()
-    cfg = load_config("config/app.yaml")
 
     async def run():
         """主运行函数 - 改进的异步生命周期管理"""
-        clients = None
         services = []
-        
         try:
-            # 初始化数据库客户端（三个池）
-            clients = await get_clients(cfg.clickhouse, pool_read=8, pool_write=8, pool_backfill=16)
             bus = EventBus()
-            
             if args.cmd == "clientserver":
-                srv = ClientServer(clients.read, host=args.host, port=args.port, qps=args.qps, event_bus=bus)
+                srv = ClientServer(host=args.host, port=args.port, qps=args.qps, event_bus=bus)
                 services.append(srv)
                 await srv.start()
                 
@@ -78,7 +70,6 @@ def main():
                     logger.info("收到键盘中断")
                 
             elif args.cmd == "backfill-gap":
-                from common.types import MarketType, build_market_symbol
                 # 从资产构造或直接使用符号；资产优先
                 if args.asset:
                     symbol = build_market_symbol(args.asset, MarketType(args.market))
@@ -86,7 +77,7 @@ def main():
                     symbol = args.symbol.upper()
                 else:
                     raise ValueError("必须提供 --asset 或 --symbol")
-                mgr = BackfillManager(cfg, clients.read, clients.backfill)
+                mgr = BackfillManager()
                 services.append(mgr)
                 await mgr.start()
                 await mgr.backfill_gap(
@@ -97,7 +88,6 @@ def main():
                     args.end_ms
                 )
             elif args.cmd == "ws-start":
-                from common.types import MarketType, build_market_symbol
                 # 从资产构造或直接使用符号；资产优先
                 if args.asset:
                     symbol = build_market_symbol(args.asset, MarketType(args.market))
@@ -105,7 +95,7 @@ def main():
                     symbol = args.symbol.upper()
                 else:
                     raise ValueError("必须提供 --asset 或 --symbol")
-                sup = WebSocketSupervisor(cfg, clients.read, clients.write, event_bus=bus)
+                sup = WebSocketSupervisor(event_bus=bus)
                 services.append(sup)
                 await sup.start_stream(args.market, symbol, args.period)
                 logger.info(f"WebSocket流已启动: {args.market} {symbol} {args.period}")
@@ -143,14 +133,10 @@ def main():
                     logger.warning("部分服务关闭超时")
             
             # 关闭数据库客户端
-            if clients:
-                try:
-                    await clients.read.close()
-                    await clients.write.close()
-                    await clients.backfill.close()
-                    logger.info("数据库连接已关闭")
-                except Exception as e:
-                    logger.error(f"关闭数据库连接失败: {e}")
+            try:
+                logger.info("数据库连接已关闭")
+            except Exception as e:
+                logger.error(f"关闭数据库连接失败: {e}")
             logger.info("所有服务已关闭")
 
     asyncio.run(run())

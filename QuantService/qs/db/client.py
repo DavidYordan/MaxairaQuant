@@ -3,7 +3,7 @@ import asyncio
 import clickhouse_connect
 from clickhouse_connect.driver.asyncclient import AsyncClient
 from loguru import logger
-from ..config.schema import ClickHouseConfig
+from ..config.loader import get_config
 
 
 class AsyncClickHouseClient:
@@ -32,6 +32,7 @@ class AsyncClickHouseClient:
         await self._client.close()
 
 
+# 类：ClickHouseClientManager（片段）
 class ClickHouseClientManager:
     """
     负责：
@@ -39,8 +40,8 @@ class ClickHouseClientManager:
     - bulkwrite 按需创建：get_bulkwrite() 时没有就建，有就复用
     - 限制 bulkwrite 最大数量
     """
-    def __init__(self, cfg: ClickHouseConfig, max_bulkwrite: int = 4):
-        self.cfg = cfg
+    def __init__(self, max_bulkwrite: int = 4):
+        self.cfg = get_config().clickhouse
         self.max_bulkwrite = max_bulkwrite
 
         self._read: AsyncClickHouseClient | None = None
@@ -106,7 +107,14 @@ class ClickHouseClientManager:
                     self._write.command(cmd),
                 )
 
-            logger.info("✅ ClickHouse base clients (read/bulkread/write) ready")
+            logger.info("ClickHouse base clients (read/bulkread/write) ready")
+
+            # 预创建 bulkwrite 连接池（size = max_bulkwrite）
+            self._bulkwrites = []
+            for _ in range(self.max_bulkwrite):
+                cli = await self._make_bulkwrite()
+                self._bulkwrites.append(cli)
+            logger.info("ClickHouse bulkwrite pool ready: {}", len(self._bulkwrites))
 
     async def _make_bulkwrite(self) -> AsyncClickHouseClient:
         """真正创建一条 bulkwrite 连接并做写配置"""
@@ -139,33 +147,65 @@ class ClickHouseClientManager:
         return cli
 
     async def get_read(self) -> AsyncClickHouseClient:
-        await self.init_base()
+        if self._read is None:
+            await self.init_base()
         return self._read
 
     async def get_bulkread(self) -> AsyncClickHouseClient:
-        await self.init_base()
+        if self._bulkread is None:
+            await self.init_base()
         return self._bulkread
 
     async def get_write(self) -> AsyncClickHouseClient:
-        await self.init_base()
+        if self._write is None:
+            await self.init_base()
         return self._write
 
     async def get_bulkwrite(self) -> AsyncClickHouseClient:
         """
-        如果已有 bulkwrite，就按轮询给一个；
-        如果还没建够 max_bulkwrite，就新建一个；
-        多协程同时进来靠 _bulkwrite_lock 保证只建一次。
+        轮询返回 bulkwrite 连接；如未初始化则自动构建池
         """
-        await self.init_base()
-
         async with self._bulkwrite_lock:
-            if self._bulkwrites:
-                # 简单返回最后一个，或者也可以 round-robin
-                cli = self._bulkwrites.pop(0)
-                self._bulkwrites.append(cli)
-                return cli
-
-            # 第一次进来，一个都没有，就建一条
-            cli = await self._make_bulkwrite()
+            if not self._bulkwrites:
+                await self.init_base()
+            cli = self._bulkwrites.pop(0)
             self._bulkwrites.append(cli)
             return cli
+
+    async def close_all(self):
+        """统一关闭所有 ClickHouse 客户端连接"""
+        async with self._init_lock:
+            # 关闭基础连接
+            for cli in (self._read, self._bulkread, self._write):
+                if cli is not None:
+                    try:
+                        await cli.close()
+                    except Exception as e:
+                        logger.warning("关闭 ClickHouse 客户端失败: {}", e)
+            # 关闭 bulkwrite 连接
+            for cli in self._bulkwrites:
+                try:
+                    await cli.close()
+                except Exception as e:
+                    logger.warning("关闭 ClickHouse bulkwrite 客户端失败: {}", e)
+            # 清理引用
+            self._read = None
+            self._bulkread = None
+            self._write = None
+            self._bulkwrites = []
+
+_CLIENTS_MGR: ClickHouseClientManager | None = None
+
+def get_client_manager() -> ClickHouseClientManager:
+    global _CLIENTS_MGR
+    if _CLIENTS_MGR is None:
+        _CLIENTS_MGR = ClickHouseClientManager()
+    return _CLIENTS_MGR
+
+async def close_all_clients() -> None:
+    global _CLIENTS_MGR
+    if _CLIENTS_MGR is not None:
+        try:
+            await _CLIENTS_MGR.close_all()
+        finally:
+            _CLIENTS_MGR = None

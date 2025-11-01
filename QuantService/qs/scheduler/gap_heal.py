@@ -1,15 +1,14 @@
 from __future__ import annotations
 import asyncio
 import time
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from loguru import logger
-from ..config.schema import AppConfig
 from ..db.schema import kline_table_name
-from ..db.queries import get_enabled_pairs, find_gaps_windowed_sql, get_max_open_time
+from ..db.queries import get_enabled_pairs, find_gaps_windowed_sql
 from ..services.backfill.manager import BackfillManager
 from ..gateways.binance_rest import step_ms
+from ..config.loader import get_config
 from ..common.types import MarketType
-from ..db.client import AsyncClickHouseClient
 
 
 class GapHealScheduler:
@@ -22,9 +21,7 @@ class GapHealScheduler:
     - 仅对真实缺口派发回填任务，避免重复写入
     """
 
-    def __init__(self, cfg: AppConfig, ch_client: AsyncClickHouseClient, backfill: BackfillManager):
-        self.cfg = cfg
-        self.client = ch_client
+    def __init__(self, backfill: BackfillManager):
         self.backfill = backfill
 
         self._tasks: List[asyncio.Task] = []
@@ -38,13 +35,12 @@ class GapHealScheduler:
         self._running_keys: Dict[str, bool] = {}
 
         # 额外去重：按交易对/周期维度，记录正在处理的区间，防止重叠派发
-        from typing import Tuple
         self._running_ranges: Dict[str, List[Tuple[int, int]]] = {}
 
         # 高水位注册表：按交易对/市场/周期维度维护
         self._hwm: Dict[str, int] = {}
         try:
-            self._default_start_ms = int(time.mktime(time.strptime(self.cfg.binance.historical_start_dates, "%Y-%m-%d")) * 1000)
+            self._default_start_ms = int(time.mktime(time.strptime(get_config().binance.historical_start_dates, "%Y-%m-%d")) * 1000)
         except Exception:
             # 配置异常时，退化为回看 7 天
             self._default_start_ms = int(time.time() * 1000) - 7 * 24 * 60 * 60 * 1000
@@ -149,7 +145,7 @@ class GapHealScheduler:
     async def _get_enabled_pairs_with_retry(self, max_retries: int = 3):
         for attempt in range(max_retries):
             try:
-                return await get_enabled_pairs(self.client)
+                return await get_enabled_pairs()
             except Exception as e:
                 if attempt == max_retries - 1:
                     logger.error(f"获取交易对失败，已重试{max_retries}次: {e}")
@@ -192,7 +188,7 @@ class GapHealScheduler:
 
             # 查找缺口
             try:
-                gaps = await find_gaps_windowed_sql(self.client, table, start_ms, end_ms, s_ms)
+                gaps = await find_gaps_windowed_sql(table, start_ms, end_ms, s_ms)
             except Exception as e:
                 logger.error(f"缺口查询失败 {market} {symbol} {period}: {e}")
                 return

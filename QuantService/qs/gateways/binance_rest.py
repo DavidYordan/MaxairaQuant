@@ -1,15 +1,16 @@
 from __future__ import annotations
 from typing import Optional, Dict
 from ..common.types import MarketType
-from ..config.schema import AppConfig
+from ..config.loader import get_config
 
-def rest_url(cfg: AppConfig, market: MarketType) -> str:
+def rest_url(market: MarketType) -> str:
+    cfg = get_config().binance
     if market == MarketType.spot:
-        return cfg.binance.spot.rest_url
+        return cfg.spot.rest_url
     elif market == MarketType.um:
-        return cfg.binance.um.rest_url
+        return cfg.um.rest_url
     else:
-        return cfg.binance.cm.rest_url
+        return cfg.cm.rest_url
 
 def step_ms(period: str) -> int:
     if period == "1m":

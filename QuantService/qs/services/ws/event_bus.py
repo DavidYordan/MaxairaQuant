@@ -163,7 +163,6 @@ class EventBus:
             'topics': {
                 topic: {
                     'subscribers': len(queues),
-                    'queue_sizes': [q.qsize() for q in queues if not q._closed]
                 }
                 for topic, queues in self._subs.items()
             }
