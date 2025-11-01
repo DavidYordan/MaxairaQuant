@@ -186,37 +186,73 @@ class GapHealScheduler:
             if start_ms >= end_ms:
                 return
 
-            # 查找缺口
+            # 查找缺口（单次扫描仅查询一次）
             try:
                 gaps = await find_gaps_windowed_sql(table, start_ms, end_ms, s_ms)
             except Exception as e:
                 logger.error(f"缺口查询失败 {market} {symbol} {period}: {e}")
                 return
 
-            group = self._group_key(market, symbol, period)
-            running = self._running_ranges.get(group, [])
-
             if not gaps:
+                # 无缺口：水位直接推进到当前末尾+一步
                 self._set_hwm(market, symbol, period, end_ms + s_ms)
                 return
 
-            # 按缺口维度派发回填任务，增加“重叠区间防重复”
-            for gs, ge in gaps:
-                # 如果与当前正在处理的区间有重叠，则跳过，避免重复子集/重叠区间
-                overlapped = any(self._overlaps(gs, ge, rgs, rge) for (rgs, rge) in running)
-                if overlapped:
-                    continue
+            # 并发回填所有缺口，并在本次扫描内等待所有结果
+            async def _heal_one(gs: int, ge: int):
+                async with self._task_semaphore:
+                    logger.info(f"开始回填缺口：{market} {symbol} {period} [{gs},{ge}]")
+                    summary = await self.backfill.backfill_gap(MarketType(market), symbol, period, gs, ge)
+                    logger.info(f"回填完成：{market} {symbol} {period} [{gs},{ge}] rows={summary.total_rows} ok={summary.all_ok}")
+                    return summary
 
-                key = f"{market}|{symbol}|{period}|{gs}|{ge}"
-                if self._running_keys.get(key, False):
-                    continue
+            tasks = [
+                asyncio.create_task(_heal_one(gs, ge), name=f"heal_{market}_{symbol}_{period}_{gs}_{ge}")
+                for gs, ge in gaps
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                self._running_keys[key] = True
-                self._running_ranges.setdefault(group, []).append((gs, ge))
-                asyncio.create_task(
-                    self._dispatch_and_release(key, group, market, symbol, period, gs, ge),
-                    name=f"heal_{market}_{symbol}_{period}_{gs}_{ge}"
-                )
+            # 统一水位推进决策：全部缺口都成功 -> 推进到当前末尾+一步
+            all_ok = True
+            for res in results:
+                if isinstance(res, Exception):
+                    all_ok = False
+                    continue
+                ok = getattr(res, "all_ok", False)
+                # Spot 的“正常但无数据”已在 BackfillSummary 中计为 all_ok=True
+                if not ok:
+                    all_ok = False
+
+            if all_ok:
+                self._set_hwm(market, symbol, period, end_ms + s_ms)
+                logger.info(f"本次扫描缺口全部成功，水位前移到当前末尾：{market} {symbol} {period} HWM -> {end_ms + s_ms}")
+            else:
+                # 保守：不推进水位，留待下一轮继续处理失败的窗口
+                logger.info(f"本次扫描存在失败窗口，暂不提升水位：{market} {symbol} {period}")
+        group = self._group_key(market, symbol, period)
+        running = self._running_ranges.get(group, [])
+
+        if not gaps:
+            self._set_hwm(market, symbol, period, end_ms + s_ms)
+            return
+
+        # 按缺口维度派发回填任务，增加“重叠区间防重复”
+        for gs, ge in gaps:
+            # 如果与当前正在处理的区间有重叠，则跳过，避免重复子集/重叠区间
+            overlapped = any(self._overlaps(gs, ge, rgs, rge) for (rgs, rge) in running)
+            if overlapped:
+                continue
+
+            key = f"{market}|{symbol}|{period}|{gs}|{ge}"
+            if self._running_keys.get(key, False):
+                continue
+
+            self._running_keys[key] = True
+            self._running_ranges.setdefault(group, []).append((gs, ge))
+            asyncio.create_task(
+                self._dispatch_and_release(key, group, market, symbol, period, gs, ge),
+                name=f"heal_{market}_{symbol}_{period}_{gs}_{ge}"
+            )
 
     async def _dispatch_and_release(self, key: str, group: str, market: str, symbol: str, period: str, gs: int, ge: int):
         try:
@@ -226,14 +262,7 @@ class GapHealScheduler:
                     MarketType(market), symbol, period, gs, ge
                 )
                 logger.info(f"回填完成：{market} {symbol} {period} [{gs},{ge}] rows={summary.total_rows} ok={summary.all_ok}")
-                # Spot 历史真空缺：API响应正常且无数据 -> 提升水位跳过该缺口
-                try:
-                    if MarketType(market) == MarketType.spot and summary.all_ok and summary.total_rows == 0:
-                        s = step_ms(period)
-                        self._set_hwm(market, symbol, period, ge + s)
-                        logger.info(f"确认空缺窗口，水位前移：{market} {symbol} {period} HWM -> {ge + s}")
-                except Exception as e:
-                    logger.warning(f"提升水位失败（非致命）：{market} {symbol} {period} 错误={e}")
+                # 注意：水位不在单窗口阶段更新，统一在 _scan_pair 中汇总推进
         except Exception as e:
             logger.error(f"回填失败：{market} {symbol} {period} [{gs},{ge}] 错误={e}")
         finally:
